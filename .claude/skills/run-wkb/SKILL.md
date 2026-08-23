@@ -52,6 +52,15 @@ python3 wkb.py ls
 python3 wkb.py bridge records/wkb-YYYYMMDD-xxxx.md --target json
 # → status: SUCCESS|DEGRADED|FAILED, dropped_fields, payload
 
+python3 wkb.py dispatch --topic "..." \
+  --provider "claude=some-command" --provider "other=some-other-command" [--seal]
+# → runs each COMMAND with the topic on stdin, its response on stdout.
+#   verdict: AGREE (identical sha across all responses) or DISAGREE
+#   (any differ) — never averaged/blended. --seal writes it as a real
+#   WKB observation record. --provider is a real shell command today
+#   (echo, ollama run <model>, a curl+jq one-liner) — no model
+#   credentials are wired in by default; point it at whatever you have.
+
 python3 wkb.py bridge records/wkb-YYYYMMDD-xxxx.md --target restore
 # → semantic translation: walks the parent chain and produces a
 #   natural-language briefing a fresh LLM session can restore from,
@@ -144,6 +153,13 @@ part of the workflow:
   round-trip through `base64 -w0 <file>` copied verbatim into
   `base64Content`, and always verify by downloading it back and
   sha-comparing before considering the upload done.
+- **`dispatch` verdict is binary (AGREE/DISAGREE), not a similarity
+  score.** Any single differing byte between provider responses ->
+  DISAGREE. This is deliberate — the whole point is to preserve
+  disagreement, not paper over it with fuzzy matching.
+- **A provider is a plain shell command run with `shell=True`.** Fine
+  for your own local tools (same trust model as a Makefile); don't
+  wire `--provider` to untrusted input.
 - **No emoji rendering.** The v1.0 emoji legend was never recovered
   from source material — this implementation is YAML-only.
 - **`--target restore` is the only *semantic* target** — `json`/`csv`

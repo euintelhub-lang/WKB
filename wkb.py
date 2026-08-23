@@ -40,6 +40,7 @@ import hashlib
 import io
 import json
 import re
+import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field as dataclass_field
@@ -450,6 +451,111 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- Dispatch --------------------------------------------------------------
+# Multi-provider query that preserves disagreement instead of averaging it
+# away. Each design choice traces to something observed this session:
+#   - sha per Position, captured at the moment of receipt, never retyped
+#     (the Drive upload bug: manual re-composition silently drops words)
+#   - verdict is AGREE/DISAGREE, never a blended "consensus" text
+#     (the Bridge pattern: explicit SUCCESS/DEGRADED/FAILED, not silent loss)
+#   - providers are shell commands, not hardcoded APIs
+#     (no real model credentials exist in this environment; this makes the
+#     mechanism itself real and testable today, wireable to any real model
+#     tomorrow without a redesign)
+
+PROVIDER_TIMEOUT_SECONDS = 60
+
+
+@dataclass
+class Position:
+    provider: str
+    text: str
+    sha: str
+
+
+@dataclass
+class DispatchResult:
+    topic: str
+    positions: list
+    verdict: str  # AGREE | DISAGREE
+    parent: str | None = None
+
+
+def _run_provider(name: str, command: str, topic: str) -> Position:
+    try:
+        proc = subprocess.run(
+            command, shell=True, input=topic, capture_output=True,
+            text=True, timeout=PROVIDER_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise WkbError(f"provider '{name}' timed out after {PROVIDER_TIMEOUT_SECONDS}s")
+    if proc.returncode != 0:
+        raise WkbError(f"provider '{name}' failed (exit {proc.returncode}): {proc.stderr.strip()}")
+    text = proc.stdout.strip()
+    if not text:
+        raise WkbError(f"provider '{name}' returned empty output")
+    return Position(provider=name, text=text, sha=body_sha(text + "\n"))
+
+
+def dispatch(topic: str, providers: dict) -> DispatchResult:
+    positions = [_run_provider(name, command, topic) for name, command in providers.items()]
+    verdict = "AGREE" if len({p.sha for p in positions}) == 1 else "DISAGREE"
+    return DispatchResult(topic=topic, positions=positions, verdict=verdict)
+
+
+def cmd_dispatch(args: argparse.Namespace) -> int:
+    providers = {}
+    for spec in args.provider:
+        if "=" not in spec:
+            print(f"error: --provider must be NAME=COMMAND, got {spec!r}", file=sys.stderr)
+            return 2
+        name, _, command = spec.partition("=")
+        providers[name] = command
+
+    try:
+        result = dispatch(args.topic, providers)
+    except WkbError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    print(f"topic: {result.topic}")
+    print(f"verdict: {result.verdict}")
+    for p in result.positions:
+        print(f"\n[{p.provider}] sha={p.sha[:12]}...")
+        print(p.text)
+
+    if args.seal:
+        body_lines = [f"Dispatch: {result.topic}", f"Verdict: {result.verdict}", ""]
+        for p in result.positions:
+            body_lines.append(f"[{p.provider}]")
+            body_lines.append(p.text)
+            body_lines.append("")
+        body = "\n".join(body_lines).rstrip("\n") + "\n"
+
+        parents = [args.parent] if args.parent else []
+        for pid in parents:
+            validate_id(pid, "parent")
+
+        record_id = make_id()
+        header = {
+            "wkb": WKB_VERSION,
+            "id": record_id,
+            "type": "observation",
+            "status": "pending",
+            "parent": parents,
+            "interpretation": "",
+            "topic": f"Dispatch: {result.topic}",
+            "sha": body_sha(body),
+        }
+        out_dir = Path(args.dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{record_id}.md"
+        out_path.write_text(render_record(header, body), encoding="utf-8")
+        print(f"\nsealed {out_path} id={record_id}")
+
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wkb.py", description=__doc__)
     sub = p.add_subparsers(dest="command", required=True)
@@ -485,6 +591,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="directory to resolve --target restore's parent chain from (default: the file's own directory)",
     )
     bridge.set_defaults(func=cmd_bridge)
+
+    dispatch_p = sub.add_parser(
+        "dispatch", help="query multiple model providers on a topic, preserve disagreement"
+    )
+    dispatch_p.add_argument("--topic", required=True)
+    dispatch_p.add_argument(
+        "--provider", action="append", required=True, metavar="NAME=COMMAND",
+        help="repeatable; shell command that reads the topic on stdin, prints its response on stdout",
+    )
+    dispatch_p.add_argument("--parent", default=None, help="wkb id this dispatch is about")
+    dispatch_p.add_argument("--seal", action="store_true", help="seal the result as a WKB record")
+    dispatch_p.add_argument("--dir", default=str(DEFAULT_DIR))
+    dispatch_p.set_defaults(func=cmd_dispatch)
 
     return p
 
