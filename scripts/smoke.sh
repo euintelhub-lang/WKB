@@ -58,4 +58,22 @@ pass "bridge on tampered record -> FAILED"
 $WKB ls | grep -q "$id" || fail "ls is missing a sealed record"
 pass "ls"
 
+# 7. bridge --target restore: two-hop parent chain -> SUCCESS, lineage in order
+out4=$($WKB seal --type decision --topic "restore: child" --parent "$id3" --body "restore target smoke test")
+id4=$(echo "$out4" | extract_id)
+restore_result=$($WKB bridge "records/$id4.md" --target restore)
+echo "$restore_result" | grep -q "^status: SUCCESS" || fail "restore bridge (full chain) was not SUCCESS"
+echo "$restore_result" | grep -q "\[$id\]" || fail "restore bridge lineage is missing grandparent $id"
+echo "$restore_result" | grep -q "\[$id2\]" || fail "restore bridge lineage is missing grandparent $id2"
+echo "$restore_result" | grep -q "\[$id3\]" || fail "restore bridge lineage is missing immediate parent $id3"
+pass "bridge restore -> SUCCESS (3-node lineage resolved)"
+
+# 8. bridge --target restore: missing parent -> DEGRADED, LOSSY_ENCODING
+out5=$($WKB seal --type decision --topic "restore: orphan" --parent "wkb-20260101-dead" --body "parent was never sealed")
+id5=$(echo "$out5" | extract_id)
+orphan_result=$($WKB bridge "records/$id5.md" --target restore)
+echo "$orphan_result" | grep -q "^status: DEGRADED" || fail "restore bridge (missing parent) was not DEGRADED"
+echo "$orphan_result" | grep -q "parent: LOSSY_ENCODING" || fail "restore bridge missing parent/LOSSY_ENCODING"
+pass "bridge restore -> DEGRADED (missing ancestor)"
+
 echo "ALL SMOKE TESTS PASSED"
