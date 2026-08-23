@@ -93,6 +93,31 @@ bash scripts/smoke.sh
 Same command CI runs (`.github/workflows/ci.yml`, on push/PR/`workflow_dispatch`).
 No separate unit test suite exists yet — `scripts/smoke.sh` is it.
 
+## Persistence: Drive is the durable store
+
+`records/` is gitignored — it's runtime output, and this environment's
+container is ephemeral. A record only sealed locally is lost when the
+session ends. Every record worth keeping (not a throwaway demo) must be
+uploaded to the Drive картотека folder (`parentId`
+`1YuvaipvGP1rHTnsaAb9RcdJqm6ngsliR`), matching the ecosystem's existing
+"Google Drive е единственият източник на истина" rule.
+
+**This is mandatory, not optional, whenever `seal` runs in a session
+for a real (non-demo) record** — no hook does it independently; it's
+part of the workflow:
+
+1. `wkb.py seal ...` locally, as normal.
+2. Get the exact bytes without retyping them:
+   `base64 -w0 records/<id>.md` — copy that output verbatim.
+3. `mcp__Google_Drive__create_file` with `base64Content` (not
+   `textContent` — see Gotchas below), `parentId` as above,
+   `contentMimeType: text/markdown`, `disableConversionToGoogleType: true`.
+4. **Verify — do not skip this.** `mcp__Google_Drive__download_file_content`
+   the uploaded file, decode its base64, and diff/sha-compare against
+   the local file. Only a byte-for-byte match closes the loop. If it
+   doesn't match, trash the bad upload and retry from step 2 — never
+   leave a mismatched copy in Drive.
+
 ## Gotchas
 
 - **`regime` without `@source` doesn't degrade, it's rejected outright** —
@@ -110,6 +135,15 @@ No separate unit test suite exists yet — `scripts/smoke.sh` is it.
 - **`acceptable` is always `None`/unset in `bridge` output** — this is
   intentional (v1.2 decision: "acceptable никога не се попълва
   автоматично — Rumen решава"), not a missing feature.
+- **Never pass a record's body as `textContent` to Google Drive by
+  re-typing/re-composing it in the tool call.** Hit this for real: a
+  hand-composed upload silently dropped one word from a Cyrillic body,
+  producing a Drive copy whose sha256 didn't match its own header —
+  exactly the corruption `check` exists to catch, just moved one layer
+  up where `check` can't see it (it only validates local files). Always
+  round-trip through `base64 -w0 <file>` copied verbatim into
+  `base64Content`, and always verify by downloading it back and
+  sha-comparing before considering the upload done.
 - **No emoji rendering.** The v1.0 emoji legend was never recovered
   from source material — this implementation is YAML-only.
 - **`--target restore` is the only *semantic* target** — `json`/`csv`
