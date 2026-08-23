@@ -51,6 +51,12 @@ python3 wkb.py ls
 
 python3 wkb.py bridge records/wkb-YYYYMMDD-xxxx.md --target json
 # → status: SUCCESS|DEGRADED|FAILED, dropped_fields, payload
+
+python3 wkb.py bridge records/wkb-YYYYMMDD-xxxx.md --target restore
+# → semantic translation: walks the parent chain and produces a
+#   natural-language briefing a fresh LLM session can restore from,
+#   not a structural field dump. --dir overrides where parents are
+#   looked up (default: the file's own directory).
 ```
 
 `seal` accepts `--parent <id>` (repeatable, must be a real `wkb-id`),
@@ -106,3 +112,10 @@ No separate unit test suite exists yet — `scripts/smoke.sh` is it.
   автоматично — Rumen решава"), not a missing feature.
 - **No emoji rendering.** The v1.0 emoji legend was never recovered
   from source material — this implementation is YAML-only.
+- **`--target restore` is the only *semantic* target** — `json`/`csv`
+  structurally re-encode the same fields; `restore` walks `parent`
+  and produces prose meant for a different LLM session to pick up
+  continuity from (the "Semantic Engine" from the dialog log, and the
+  first real consumer of the `parent` DAG). A missing ancestor doesn't
+  fail the bridge — it degrades with `LOSSY_ENCODING` and a note
+  naming which id(s) were unresolvable.

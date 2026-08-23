@@ -138,7 +138,7 @@ class BridgeResult:
     note: str = ""
 
 
-def _bridge_to_json(header: dict, body: str) -> BridgeResult:
+def _bridge_to_json(header: dict, body: str, records_dir: Path | None = None) -> BridgeResult:
     payload = {k: header.get(k) for k in CORE_FIELDS}
     payload["body"] = body
     return BridgeResult(
@@ -148,7 +148,83 @@ def _bridge_to_json(header: dict, body: str) -> BridgeResult:
     )
 
 
-def _bridge_to_csv(header: dict, body: str) -> BridgeResult:
+INTERPRETATION_PROSE = {
+    "": "not yet interpreted",
+    "rumen_only": "interpreted by Rumen alone",
+    "claude_only": "interpreted by Claude alone",
+    "consensus": "reached by consensus between Rumen and Claude",
+}
+
+
+def _resolve_parent_chain(
+    header: dict, records_dir: Path, visited: set[str] | None = None
+) -> tuple[list[tuple[dict, str]], list[str]]:
+    """Walk the parent chain oldest-first. Returns (chain, missing_ids)."""
+    visited = visited if visited is not None else set()
+    chain: list[tuple[dict, str]] = []
+    missing: list[str] = []
+    for parent_id in header.get("parent") or []:
+        if parent_id in visited:
+            continue  # cycle guard — the schema doesn't forbid a bad DAG
+        visited.add(parent_id)
+        parent_path = records_dir / f"{parent_id}.md"
+        if not parent_path.exists():
+            missing.append(parent_id)
+            continue
+        try:
+            p_header, p_body = split_record(parent_path.read_text(encoding="utf-8"))
+        except WkbError:
+            missing.append(parent_id)
+            continue
+        grand_chain, grand_missing = _resolve_parent_chain(p_header, records_dir, visited)
+        chain.extend(grand_chain)
+        chain.append((p_header, p_body))
+        missing.extend(grand_missing)
+    return chain, missing
+
+
+def _bridge_to_restore(header: dict, body: str, records_dir: Path | None = None) -> BridgeResult:
+    # Real semantic translation: a natural-language briefing a fresh LLM
+    # session can restore from — not a structural re-encoding of fields.
+    # This is what the WKBE dialog log calls the "Semantic Engine," and
+    # walking `parent` here is what finally gives the DAG a consumer.
+    chain, missing = _resolve_parent_chain(header, records_dir or Path("."))
+
+    lines = ["# WKB restore — context for a new LLM session", ""]
+    if chain:
+        lines.append("## Lineage (oldest -> newest)")
+        for i, (h, b) in enumerate(chain, 1):
+            preview = " ".join(b.split())[:150]
+            lines.append(
+                f"{i}. [{h.get('id')}] ({h.get('type')}, {h.get('status')}): "
+                f"\"{h.get('topic')}\" — {preview}"
+            )
+        lines.append("")
+
+    lines.append("## Current record")
+    lines.append(f"[{header.get('id')}] ({header.get('type')}, {header.get('status')})")
+    lines.append(f"Topic: {header.get('topic')}")
+    interp = header.get("interpretation") or ""
+    lines.append(f"Interpretation: {INTERPRETATION_PROSE.get(interp, interp)}")
+    regime = header.get("regime")
+    if regime:
+        state, _, source = regime.partition("@")
+        lines.append(f"Regime: {state} (per {source})")
+    if missing:
+        lines.append(f"Note: {len(missing)} ancestor record(s) not found locally: {', '.join(missing)}")
+    lines.append("")
+    lines.append("Body:")
+    lines.append(body.strip())
+
+    return BridgeResult(
+        status="DEGRADED" if missing else "SUCCESS",
+        target_format="restore",
+        dropped_fields=[{"field": "parent", "reason": REASON_LOSSY_ENCODING}] if missing else [],
+        payload="\n".join(lines),
+    )
+
+
+def _bridge_to_csv(header: dict, body: str, records_dir: Path | None = None) -> BridgeResult:
     dropped = []
     row = {}
     for f in CORE_FIELDS:
@@ -180,7 +256,7 @@ def _bridge_to_csv(header: dict, body: str) -> BridgeResult:
     )
 
 
-KNOWN_TARGETS = {"json": _bridge_to_json, "csv": _bridge_to_csv}
+KNOWN_TARGETS = {"json": _bridge_to_json, "csv": _bridge_to_csv, "restore": _bridge_to_restore}
 
 
 def _bridge_generic_fallback(header: dict, target_format: str) -> BridgeResult:
@@ -199,7 +275,9 @@ def _bridge_generic_fallback(header: dict, target_format: str) -> BridgeResult:
     )
 
 
-def bridge_record(header: dict, body: str, target_format: str) -> BridgeResult:
+def bridge_record(
+    header: dict, body: str, target_format: str, records_dir: Path | None = None
+) -> BridgeResult:
     if header.get("sha") != body_sha(body):
         return BridgeResult(
             status="FAILED",
@@ -208,7 +286,7 @@ def bridge_record(header: dict, body: str, target_format: str) -> BridgeResult:
         )
     translate = KNOWN_TARGETS.get(target_format)
     if translate:
-        return translate(header, body)
+        return translate(header, body, records_dir)
     return _bridge_generic_fallback(header, target_format)
 
 
@@ -221,7 +299,8 @@ def cmd_bridge(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    result = bridge_record(header, body, args.target)
+    records_dir = Path(args.dir) if args.dir else path.parent
+    result = bridge_record(header, body, args.target, records_dir)
     print(f"status: {result.status}")
     print(f"target_format: {result.target_format}")
     print("acceptable: <not set — Rumen decides>")
@@ -401,6 +480,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bridge.add_argument("file")
     bridge.add_argument("--target", required=True)
+    bridge.add_argument(
+        "--dir", default=None,
+        help="directory to resolve --target restore's parent chain from (default: the file's own directory)",
+    )
     bridge.set_defaults(func=cmd_bridge)
 
     return p
