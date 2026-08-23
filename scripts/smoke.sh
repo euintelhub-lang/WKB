@@ -76,4 +76,28 @@ echo "$orphan_result" | grep -q "^status: DEGRADED" || fail "restore bridge (mis
 echo "$orphan_result" | grep -q "parent: LOSSY_ENCODING" || fail "restore bridge missing parent/LOSSY_ENCODING"
 pass "bridge restore -> DEGRADED (missing ancestor)"
 
+# 9. dispatch: two agreeing providers -> AGREE
+agree_out=$($WKB dispatch --topic "smoke: agree" --provider "a=echo same" --provider "b=echo same")
+echo "$agree_out" | grep -q "^verdict: AGREE" || fail "dispatch did not report AGREE for identical provider output"
+pass "dispatch -> AGREE"
+
+# 10. dispatch: two disagreeing providers -> DISAGREE, both texts preserved
+disagree_out=$($WKB dispatch --topic "smoke: disagree" --provider "a=echo one" --provider "b=echo two")
+echo "$disagree_out" | grep -q "^verdict: DISAGREE" || fail "dispatch did not report DISAGREE for differing provider output"
+echo "$disagree_out" | grep -q "^one$" || fail "dispatch lost provider a's text"
+echo "$disagree_out" | grep -q "^two$" || fail "dispatch lost provider b's text"
+pass "dispatch -> DISAGREE (both positions preserved)"
+
+# 11. dispatch: a failing provider surfaces the error, doesn't crash
+broken_exit=0
+$WKB dispatch --topic "smoke: broken" --provider "bad=exit 1" >/dev/null 2>&1 || broken_exit=$?
+[ "$broken_exit" -eq 2 ] || fail "dispatch did not exit 2 on a failing provider (got $broken_exit)"
+pass "dispatch -> error on failing provider"
+
+# 12. dispatch --seal: produces a real, checkable WKB record
+$WKB dispatch --topic "smoke: seal" --provider "a=echo x" --provider "b=echo y" --seal >/dev/null
+dispatch_id=$(ls -t records/*.md | head -1)
+$WKB check "$dispatch_id" | grep -q "^PASS" || fail "sealed dispatch record did not pass check"
+pass "dispatch --seal -> real checkable record"
+
 echo "ALL SMOKE TESTS PASSED"
