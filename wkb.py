@@ -7,7 +7,9 @@ Built from the schema reconstructed out of Google Drive material:
     sha is a real checksum on the body; regime is state@source or absent)
   - the WKBE dialog log (interpretation enum added 2026-08-16)
 
-Three commands, as named in that dialog log: check, seal, ls.
+Four commands: check, seal, ls (named in the dialog log), plus bridge —
+the BridgeResult contract added 2026-08-16 (SUCCESS/DEGRADED/FAILED,
+dropped_fields with a reason, generic fallback for unknown targets).
 
 Record format: a Markdown file with a YAML frontmatter header (delimited
 by '---' lines), followed by a free-text body.
@@ -33,10 +35,14 @@ Known gaps, left unfilled rather than guessed:
 """
 
 import argparse
+import csv
 import hashlib
+import io
+import json
 import re
 import sys
 import uuid
+from dataclasses import dataclass, field as dataclass_field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -100,6 +106,139 @@ def render_record(header: dict, body: str) -> str:
 
 def body_sha(body: str) -> str:
     return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+# --- Bridge --------------------------------------------------------------
+# From the WKBE dialog log, 2026-08-16: "Bridge частично решен — BridgeResult
+# contract + generic fallback." Closed enum SUCCESS/DEGRADED/FAILED.
+# dropped_fields carries a reason (NO_TARGET_EQUIVALENT / LOSSY_ENCODING /
+# CONSTRAINT_EXCEEDED). acceptable is never auto-filled — a human decides.
+# Unknown target_format falls back to the 9 core fields, raw, untranslated,
+# marked DEGRADED.
+
+CORE_FIELDS = (
+    "wkb", "id", "type", "status", "parent",
+    "interpretation", "topic", "sha", "regime",
+)  # the 9 fields from the v1.2 critique (regime is the one that's optional)
+
+REASON_NO_TARGET_EQUIVALENT = "NO_TARGET_EQUIVALENT"
+REASON_LOSSY_ENCODING = "LOSSY_ENCODING"
+REASON_CONSTRAINT_EXCEEDED = "CONSTRAINT_EXCEEDED"
+
+CSV_CELL_LIMIT = 200  # a flat CSV cell can't hold arbitrary body length
+
+
+@dataclass
+class BridgeResult:
+    status: str  # SUCCESS | DEGRADED | FAILED
+    target_format: str
+    dropped_fields: list = dataclass_field(default_factory=list)
+    acceptable: None = None  # spec: never auto-filled, Rumen decides
+    payload: object = None
+    note: str = ""
+
+
+def _bridge_to_json(header: dict, body: str) -> BridgeResult:
+    payload = {k: header.get(k) for k in CORE_FIELDS}
+    payload["body"] = body
+    return BridgeResult(
+        status="SUCCESS",
+        target_format="json",
+        payload=json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=False),
+    )
+
+
+def _bridge_to_csv(header: dict, body: str) -> BridgeResult:
+    dropped = []
+    row = {}
+    for f in CORE_FIELDS:
+        v = header.get(f)
+        if f == "parent" and isinstance(v, list):
+            if len(v) > 1:
+                dropped.append({"field": "parent", "reason": REASON_LOSSY_ENCODING})
+            v = v[0] if v else ""
+        row[f] = "" if v is None else str(v)
+
+    if "\n" in body:
+        dropped.append({"field": "body", "reason": REASON_LOSSY_ENCODING})
+    body_cell = " ".join(body.split())
+    if len(body_cell) > CSV_CELL_LIMIT:
+        dropped.append({"field": "body", "reason": REASON_CONSTRAINT_EXCEEDED})
+        body_cell = body_cell[:CSV_CELL_LIMIT]
+    row["body"] = body_cell
+
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(CORE_FIELDS) + ["body"])
+    writer.writeheader()
+    writer.writerow(row)
+
+    return BridgeResult(
+        status="DEGRADED" if dropped else "SUCCESS",
+        target_format="csv",
+        dropped_fields=dropped,
+        payload=buf.getvalue(),
+    )
+
+
+KNOWN_TARGETS = {"json": _bridge_to_json, "csv": _bridge_to_csv}
+
+
+def _bridge_generic_fallback(header: dict, target_format: str) -> BridgeResult:
+    payload = {k: header.get(k) for k in CORE_FIELDS}
+    dropped = [
+        {"field": k, "reason": REASON_NO_TARGET_EQUIVALENT}
+        for k in header
+        if k not in CORE_FIELDS
+    ]
+    return BridgeResult(
+        status="DEGRADED",
+        target_format=target_format,
+        dropped_fields=dropped,
+        payload=payload,
+        note="unknown target_format — generic fallback, core fields only, no semantic translation",
+    )
+
+
+def bridge_record(header: dict, body: str, target_format: str) -> BridgeResult:
+    if header.get("sha") != body_sha(body):
+        return BridgeResult(
+            status="FAILED",
+            target_format=target_format,
+            note="record fails its own sha check — refusing to bridge an unverified record",
+        )
+    translate = KNOWN_TARGETS.get(target_format)
+    if translate:
+        return translate(header, body)
+    return _bridge_generic_fallback(header, target_format)
+
+
+def cmd_bridge(args: argparse.Namespace) -> int:
+    path = Path(args.file)
+    text = path.read_text(encoding="utf-8")
+    try:
+        header, body = split_record(text)
+    except WkbError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+
+    result = bridge_record(header, body, args.target)
+    print(f"status: {result.status}")
+    print(f"target_format: {result.target_format}")
+    print("acceptable: <not set — Rumen decides>")
+    if result.note:
+        print(f"note: {result.note}")
+    if result.dropped_fields:
+        print("dropped_fields:")
+        for d in result.dropped_fields:
+            print(f"  - {d['field']}: {d['reason']}")
+    else:
+        print("dropped_fields: []")
+    if result.payload is not None:
+        print("payload:")
+        payload = result.payload
+        print(payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, indent=2))
+
+    return 1 if result.status == "FAILED" else 0
 
 
 def cmd_seal(args: argparse.Namespace) -> int:
@@ -256,6 +395,13 @@ def build_parser() -> argparse.ArgumentParser:
     ls = sub.add_parser("ls", help="list records in a directory")
     ls.add_argument("--dir", default=str(DEFAULT_DIR))
     ls.set_defaults(func=cmd_ls)
+
+    bridge = sub.add_parser(
+        "bridge", help="translate a record to a target format (SUCCESS/DEGRADED/FAILED)"
+    )
+    bridge.add_argument("file")
+    bridge.add_argument("--target", required=True)
+    bridge.set_defaults(func=cmd_bridge)
 
     return p
 
