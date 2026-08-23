@@ -1,11 +1,11 @@
 ---
 name: run-wkb
-description: Build, run, and test wkb.py (seal/check/ls/bridge — the WKB v1.2 record CLI). Use when asked to run wkb, test wkb.py, seal a WKB record, check a record's checksum, or bridge a record to another format.
+description: Build, run, and test wkb.py (seal/check/ls/bridge/dispatch — the WKB record CLI, conforming to ecosystem's contracts/agent-output.schema.yaml). Use when asked to run wkb, test wkb.py, seal a WKB record, check a record's checksum, or bridge a record to another format.
 ---
 
 `wkb.py` is a single-file Python CLI at the repo root — no build step,
 no server, no GUI. Drive it directly, or via `scripts/smoke.sh`
-(the same script CI runs) for an end-to-end pass over all four
+(the same script CI runs) for an end-to-end pass over all five
 commands. All paths below are relative to the repo root.
 
 ## Prerequisites
@@ -40,7 +40,9 @@ safe to run repeatedly — it doesn't touch a `records/` dir in the repo.
 Individual commands, run from the repo root (records land in `./records/`):
 
 ```bash
-python3 wkb.py seal --type decision --topic "..." --body "..."
+python3 wkb.py seal --agent your-agent-name --type report --topic "..." --body "..."
+# --type is a closed enum: extraction, classification, alert, report, sync
+# --status defaults to SUCCESS (also closed: SUCCESS, PARTIAL, FAILED)
 # → sealed records/wkb-YYYYMMDD-xxxx.md id=wkb-YYYYMMDD-xxxx sha=...
 
 python3 wkb.py check records/wkb-YYYYMMDD-xxxx.md
@@ -57,7 +59,7 @@ python3 wkb.py dispatch --topic "..." \
 # → runs each COMMAND with the topic on stdin, its response on stdout.
 #   verdict: AGREE (identical sha across all responses) or DISAGREE
 #   (any differ) — never averaged/blended. --seal writes it as a real
-#   WKB observation record. --provider is a real shell command today
+#   WKB record with type=report. --provider is a real shell command today
 #   (echo, ollama run <model>, a curl+jq one-liner) — no model
 #   credentials are wired in by default; point it at whatever you have.
 
@@ -68,10 +70,13 @@ python3 wkb.py bridge records/wkb-YYYYMMDD-xxxx.md --target restore
 #   looked up (default: the file's own directory).
 ```
 
-`seal` accepts `--parent <id>` (repeatable, must be a real `wkb-id`),
-`--regime <state>@<source>`, `--interpretation
-{rumen_only,claude_only,consensus}`, `--raw <note>`. Invalid `--parent`
-or `--regime` (missing `@source`) are rejected at seal time, not later.
+`seal` requires `--agent <name>`, `--type <enum>`, `--topic <text>`, and a
+body (`--body`/`--body-file`/stdin). `--status` defaults to `SUCCESS`.
+It also accepts `--source <text>` (ecosystem's own optional field),
+`--parent <id>` (repeatable, must be a real `wkb-id`), `--regime
+<state>@<source>`, `--interpretation {rumen_only,claude_only,consensus}`,
+`--raw <note>`. Invalid `--type`/`--status` (not in the closed enums) or
+`--regime` (missing `@source`) are rejected at seal time, not later.
 
 ## Direct invocation
 
@@ -83,9 +88,9 @@ directly instead of shelling out:
 python3 -c "
 import sys; sys.path.insert(0, '.')
 import wkb
-header = {'wkb': '1.2', 'id': 'wkb-20260823-test', 'type': 'decision',
-          'status': 'pending', 'parent': [], 'interpretation': '',
-          'topic': 't', 'sha': None, 'regime': None}
+header = {'agent': 'test', 'schema_version': '1.0', 'timestamp': '2026-08-23T00:00:00+00:00',
+          'type': 'report', 'status': 'SUCCESS', 'id': 'wkb-20260823-test',
+          'parent': [], 'interpretation': '', 'topic': 't', 'sha': None, 'regime': None}
 body = 'hello\n'
 header['sha'] = wkb.body_sha(body)
 print(wkb.bridge_record(header, body, 'json').status)
