@@ -100,4 +100,17 @@ dispatch_id=$(ls -t records/*.md | head -1)
 $WKB check "$dispatch_id" | grep -q "^PASS" || fail "sealed dispatch record did not pass check"
 pass "dispatch --seal -> real checkable record"
 
+# 13. dispatch: providers run concurrently, not sequentially. Three
+# providers each sleep 1s; sequential execution would take >=3s, parallel
+# should land well under 3s. Timed with the shell builtin, not `time`
+# piped through anything, so the measurement can't be swallowed.
+start=$(date +%s)
+$WKB dispatch --topic "smoke: concurrency" \
+  --provider "a=sleep 1 && echo a" \
+  --provider "b=sleep 1 && echo b" \
+  --provider "c=sleep 1 && echo c" >/dev/null
+elapsed=$(( $(date +%s) - start ))
+[ "$elapsed" -lt 3 ] || fail "dispatch took ${elapsed}s for 3x 1s providers -- not running concurrently"
+pass "dispatch -> providers run concurrently (${elapsed}s for 3x 1s providers)"
+
 echo "ALL SMOKE TESTS PASSED"

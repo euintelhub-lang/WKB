@@ -42,6 +42,7 @@ import json
 import re
 import subprocess
 import sys
+import threading
 import uuid
 from dataclasses import dataclass, field as dataclass_field
 from datetime import date, datetime, timezone
@@ -498,7 +499,38 @@ def _run_provider(name: str, command: str, topic: str) -> Position:
 
 
 def dispatch(topic: str, providers: dict) -> DispatchResult:
-    positions = [_run_provider(name, command, topic) for name, command in providers.items()]
+    # Providers run concurrently (each is a blocking subprocess call, so
+    # threads — not asyncio — buy the parallelism): wall time drops from
+    # sum(provider latencies) to max(provider latencies). Results are
+    # collected in `providers`' declaration order, and a failing
+    # provider's error surfaces as soon as its own thread joins, without
+    # waiting on slower providers still in flight. Threads are daemons so
+    # a still-running provider (up to PROVIDER_TIMEOUT_SECONDS) can never
+    # delay process exit on the error path — ThreadPoolExecutor can't give
+    # that guarantee, since its workers aren't daemon threads.
+    outcomes: dict[str, Position | WkbError] = {}
+
+    def _worker(name: str, command: str) -> None:
+        try:
+            outcomes[name] = _run_provider(name, command, topic)
+        except WkbError as e:
+            outcomes[name] = e
+
+    threads = {
+        name: threading.Thread(target=_worker, args=(name, command), daemon=True)
+        for name, command in providers.items()
+    }
+    for t in threads.values():
+        t.start()
+
+    positions = []
+    for name, t in threads.items():
+        t.join()
+        outcome = outcomes[name]
+        if isinstance(outcome, WkbError):
+            raise outcome
+        positions.append(outcome)
+
     verdict = "AGREE" if len({p.sha for p in positions}) == 1 else "DISAGREE"
     return DispatchResult(topic=topic, positions=positions, verdict=verdict)
 
