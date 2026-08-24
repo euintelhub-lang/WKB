@@ -6,6 +6,7 @@ import { generatePack, askNext } from "../engine/claude";
 export default function Funnel({ packs }) {
   const [pack, setPack] = useState(null);
   const [step, setStep] = useState(null);
+  const [stepDispatch, setStepDispatch] = useState(null);
   const [history, setHistory] = useState([]);
   const [resolution, setResolution] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -13,6 +14,7 @@ export default function Funnel({ packs }) {
   function reset() {
     setPack(null);
     setStep(null);
+    setStepDispatch(null);
     setHistory([]);
     setResolution(null);
   }
@@ -20,6 +22,7 @@ export default function Funnel({ packs }) {
   function startVerified(selected) {
     setPack(selected);
     setStep(selected.start);
+    setStepDispatch(null);
     setHistory([]);
     setResolution(null);
   }
@@ -29,6 +32,7 @@ export default function Funnel({ packs }) {
     const generated = await generatePack(topic);
     setPack(generated);
     setStep(generated.firstQuestion);
+    setStepDispatch(generated.dispatch);
     setHistory([]);
     setResolution(null);
     setLoading(false);
@@ -54,10 +58,11 @@ export default function Funnel({ packs }) {
     const result = await askNext(pack, nextHistory);
     setLoading(false);
     if (result.done) {
-      setResolution(result.resolution);
+      setResolution({ ...result.resolution, dispatch: result.dispatch });
       setStep(null);
     } else {
       setStep(result.question);
+      setStepDispatch(result.dispatch);
     }
   }
 
@@ -69,7 +74,7 @@ export default function Funnel({ packs }) {
     return (
       <div className="question-box">
         <div className="funnel-header">
-          <VerifiedBadge verified={pack.verified} />
+          <VerifiedBadge verified={pack.verified} verdict={stepDispatch?.verdict} />
         </div>
         <p className="question-text">{step.text ?? step}</p>
         <div className="yes-no-row">
@@ -109,7 +114,7 @@ export default function Funnel({ packs }) {
           <VerifiedBadge verified={false} />
         </div>
         <div className="pack-card-desc">
-          Създава pack на момента чрез Claude — не е верифициран.
+          Създава pack на момента чрез dispatch към няколко модела — не е верифициран.
         </div>
       </button>
     </div>

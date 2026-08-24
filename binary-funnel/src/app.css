@@ -175,12 +175,30 @@ body {
   color: var(--color-generated);
 }
 
+.dispatch-positions {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid color-mix(in srgb, var(--color-generated) 40%, transparent);
+  display: grid;
+  gap: 6px;
+}
+
+.dispatch-position {
+  font-size: 0.8rem;
+}
+
+.export-link,
 .restart-link {
   display: inline-block;
   margin-top: 20px;
+  margin-right: 16px;
   color: var(--color-accent);
   cursor: pointer;
   font-size: 0.85rem;
+  background: none;
+  border: none;
+  padding: 0;
+  font-family: inherit;
 }
 
 .loading {

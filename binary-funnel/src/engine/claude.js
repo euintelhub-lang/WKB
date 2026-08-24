@@ -1,32 +1,4 @@
-const API_URL = "https://api.anthropic.com/v1/messages";
-const MODEL = "claude-sonnet-5";
-
-async function callClaude(system, userContent) {
-  const apiKey = import.meta.env.VITE_ANTHROPIC_API_KEY;
-  const response = await fetch(API_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      max_tokens: 512,
-      system,
-      messages: [{ role: "user", content: userContent }],
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Claude API error: ${response.status}`);
-  }
-
-  const data = await response.json();
-  const text = data.content?.[0]?.text ?? "{}";
-  return JSON.parse(text);
-}
+import { dispatch } from "./dispatch";
 
 const GENERATE_PACK_SYSTEM = `Ти дефинираш нов Domain Pack за да/не фуния.
 Върни само JSON от вида {"title": string, "description": string, "firstQuestion": string}.
@@ -40,10 +12,8 @@ const ASK_NEXT_SYSTEM = `Ти водиш да/не фуния стъпка по 
 Никога не връщай нищо друго освен този JSON.`;
 
 export async function generatePack(topic) {
-  const result = await callClaude(
-    GENERATE_PACK_SYSTEM,
-    `Тема на pack-а: ${topic}`
-  );
+  const round = await dispatch(GENERATE_PACK_SYSTEM, `Тема на pack-а: ${topic}`);
+  const result = JSON.parse(round.canonicalText);
   return {
     id: `generated:${Date.now()}`,
     title: result.title,
@@ -51,6 +21,7 @@ export async function generatePack(topic) {
     verified: false,
     topic,
     firstQuestion: result.firstQuestion,
+    dispatch: { verdict: round.verdict, positions: round.positions },
   };
 }
 
@@ -58,8 +29,10 @@ export async function askNext(pack, history) {
   const transcript = history
     .map((step) => `- ${step.question} => ${step.answer ? "да" : "не"}`)
     .join("\n");
-  return callClaude(
+  const round = await dispatch(
     ASK_NEXT_SYSTEM,
     `Тема: ${pack.topic}\nИстория на отговорите:\n${transcript || "(няма още)"}`
   );
+  const result = JSON.parse(round.canonicalText);
+  return { ...result, dispatch: { verdict: round.verdict, positions: round.positions } };
 }
