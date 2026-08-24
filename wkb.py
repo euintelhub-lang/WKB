@@ -43,8 +43,9 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -480,6 +481,25 @@ class DispatchResult:
     positions: list
     verdict: str  # AGREE | DISAGREE
     parent: str | None = None
+    triage: str | None = None  # judge's verdict, only ever set on DISAGREE
+    triage_error: str | None = None  # set instead of triage if the judge itself failed
+
+
+@dataclass
+class Attempt:
+    # One provider attempt, logged regardless of outcome -- unlike
+    # DispatchResult (only the AGREE/DISAGREE snapshot), this is the record
+    # of what actually happened: which provider ran, when, how long it
+    # took, and whether it succeeded, independent of what the other
+    # providers did or whether dispatch() ultimately raised. A provider
+    # that times out or errors still produces an Attempt; today that
+    # information is otherwise lost the moment WkbError propagates.
+    provider: str
+    started_at: str  # ISO 8601 UTC
+    duration_seconds: float
+    outcome: str  # success | error
+    sha: str | None = None
+    error: str | None = None
 
 
 def _run_provider(name: str, command: str, topic: str) -> Position:
@@ -498,7 +518,31 @@ def _run_provider(name: str, command: str, topic: str) -> Position:
     return Position(provider=name, text=text, sha=body_sha(text + "\n"))
 
 
-def dispatch(topic: str, providers: dict) -> DispatchResult:
+def _build_triage_prompt(topic: str, positions: list) -> str:
+    lines = [
+        f"Topic: {topic}", "",
+        "The following providers were asked the same question and disagreed. "
+        "Weigh their positions and give your own judgment.", "",
+    ]
+    for p in positions:
+        lines.append(f"[{p.provider}]")
+        lines.append(p.text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def dispatch(
+    topic: str, providers: dict, on_attempt=None, validate_provider=None, judge=None,
+) -> DispatchResult:
+    # Guard runs synchronously, before any provider starts -- structural,
+    # not advisory: a rejected provider's subprocess is never spawned, and
+    # nothing here retroactively cancels a command already running. Every
+    # provider is checked up front, so a bad one is caught before any
+    # provider (good or bad) has run, not discovered mid-batch.
+    if validate_provider is not None:
+        for name, command in providers.items():
+            validate_provider(name, command)
+
     # Providers run concurrently (each is a blocking subprocess call, so
     # threads — not asyncio — buy the parallelism): wall time drops from
     # sum(provider latencies) to max(provider latencies). Results are
@@ -511,10 +555,28 @@ def dispatch(topic: str, providers: dict) -> DispatchResult:
     outcomes: dict[str, Position | WkbError] = {}
 
     def _worker(name: str, command: str) -> None:
+        started_at = datetime.now(timezone.utc)
+        started = time.monotonic()
         try:
-            outcomes[name] = _run_provider(name, command, topic)
+            position = _run_provider(name, command, topic)
+            outcomes[name] = position
+            attempt = Attempt(
+                provider=name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="success", sha=position.sha,
+            )
         except WkbError as e:
             outcomes[name] = e
+            attempt = Attempt(
+                provider=name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="error", error=str(e),
+            )
+        # Logged here, inside the worker, so a slow or failing provider's
+        # attempt is recorded the moment it resolves -- not batched up and
+        # lost if dispatch() raises before every thread has joined.
+        if on_attempt is not None:
+            on_attempt(attempt)
 
     threads = {
         name: threading.Thread(target=_worker, args=(name, command), daemon=True)
@@ -532,7 +594,42 @@ def dispatch(topic: str, providers: dict) -> DispatchResult:
         positions.append(outcome)
 
     verdict = "AGREE" if len({p.sha for p in positions}) == 1 else "DISAGREE"
-    return DispatchResult(topic=topic, positions=positions, verdict=verdict)
+
+    # Triage is a separate pass, run only on DISAGREE -- routing on the
+    # verdict costs nothing and means an already-agreeing batch never
+    # pays for a judge call it doesn't need. The judge's own failure
+    # degrades to triage_error rather than raising: dispatch() already
+    # has a valid, checkable verdict at this point, and losing the
+    # enrichment pass shouldn't take the primary result down with it.
+    triage = None
+    triage_error = None
+    if verdict == "DISAGREE" and judge is not None:
+        judge_name, judge_command = judge
+        prompt = _build_triage_prompt(topic, positions)
+        started_at = datetime.now(timezone.utc)
+        started = time.monotonic()
+        try:
+            judge_position = _run_provider(judge_name, judge_command, prompt)
+            triage = judge_position.text
+            attempt = Attempt(
+                provider=judge_name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="success", sha=judge_position.sha,
+            )
+        except WkbError as e:
+            triage_error = str(e)
+            attempt = Attempt(
+                provider=judge_name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="error", error=str(e),
+            )
+        if on_attempt is not None:
+            on_attempt(attempt)
+
+    return DispatchResult(
+        topic=topic, positions=positions, verdict=verdict,
+        triage=triage, triage_error=triage_error,
+    )
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
@@ -544,8 +641,47 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         name, _, command = spec.partition("=")
         providers[name] = command
 
+    # Every attempt is appended here as it resolves, regardless of the
+    # eventual verdict or whether dispatch() raises -- a provider that
+    # times out is still on record, which the AGREE/DISAGREE snapshot
+    # alone can never show. One audit log per --dir, shared across runs.
+    audit_path = Path(args.dir) / "dispatch_audit.jsonl"
+    audit_lock = threading.Lock()
+
+    def _log_attempt(attempt: Attempt) -> None:
+        line = json.dumps(asdict(attempt), sort_keys=True)
+        with audit_lock:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with audit_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
     try:
-        result = dispatch(args.topic, providers)
+        deny_patterns = [re.compile(p) for p in args.deny_pattern]
+    except re.error as e:
+        print(f"error: --deny-pattern {e.pattern!r} is not a valid regex: {e}", file=sys.stderr)
+        return 2
+
+    def _validate_provider(name: str, command: str) -> None:
+        for pattern in deny_patterns:
+            if pattern.search(command):
+                raise WkbError(
+                    f"provider '{name}' rejected: command matches --deny-pattern "
+                    f"'{pattern.pattern}' -- nothing was run"
+                )
+
+    judge = None
+    if args.judge is not None:
+        if "=" not in args.judge:
+            print(f"error: --judge must be NAME=COMMAND, got {args.judge!r}", file=sys.stderr)
+            return 2
+        judge_name, _, judge_command = args.judge.partition("=")
+        judge = (judge_name, judge_command)
+
+    try:
+        result = dispatch(
+            args.topic, providers,
+            on_attempt=_log_attempt, validate_provider=_validate_provider, judge=judge,
+        )
     except WkbError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -555,12 +691,21 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     for p in result.positions:
         print(f"\n[{p.provider}] sha={p.sha[:12]}...")
         print(p.text)
+    if result.triage is not None:
+        print(f"\n[triage: {judge[0]}]")
+        print(result.triage)
+    elif result.triage_error is not None:
+        print(f"\n[triage failed] {result.triage_error}", file=sys.stderr)
 
     if args.seal:
         body_lines = [f"Dispatch: {result.topic}", f"Verdict: {result.verdict}", ""]
         for p in result.positions:
             body_lines.append(f"[{p.provider}]")
             body_lines.append(p.text)
+            body_lines.append("")
+        if result.triage is not None:
+            body_lines.append(f"[triage: {judge[0]}]")
+            body_lines.append(result.triage)
             body_lines.append("")
         body = "\n".join(body_lines).rstrip("\n") + "\n"
 
@@ -635,6 +780,18 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_p.add_argument("--parent", default=None, help="wkb id this dispatch is about")
     dispatch_p.add_argument("--seal", action="store_true", help="seal the result as a WKB record")
     dispatch_p.add_argument("--dir", default=str(DEFAULT_DIR))
+    dispatch_p.add_argument(
+        "--deny-pattern", action="append", default=[], metavar="REGEX",
+        help="repeatable; reject (before running anything) any --provider command "
+        "matching this regex. No patterns are built in -- provider commands are "
+        "arbitrary shell by design, so this is opt-in, not a sandbox.",
+    )
+    dispatch_p.add_argument(
+        "--judge", default=None, metavar="NAME=COMMAND",
+        help="optional; on DISAGREE only, run this provider against all disagreeing "
+        "positions and record its verdict as triage. Never runs on AGREE, so an "
+        "already-agreeing batch never pays for a judge call it doesn't need.",
+    )
     dispatch_p.set_defaults(func=cmd_dispatch)
 
     return p

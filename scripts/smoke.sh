@@ -113,4 +113,66 @@ elapsed=$(( $(date +%s) - start ))
 [ "$elapsed" -lt 3 ] || fail "dispatch took ${elapsed}s for 3x 1s providers -- not running concurrently"
 pass "dispatch -> providers run concurrently (${elapsed}s for 3x 1s providers)"
 
+# 14. dispatch: audit log records every provider attempt, including a
+# failing one -- even though dispatch() raises and the run never reaches
+# a verdict. This is the point of the audit trail: it survives what the
+# AGREE/DISAGREE snapshot alone cannot show.
+rm -f records/dispatch_audit.jsonl
+$WKB dispatch --topic "smoke: audit ok" --provider "a=echo x" --provider "b=echo y" >/dev/null
+[ "$(wc -l < records/dispatch_audit.jsonl)" -eq 2 ] || fail "audit log did not gain one line per successful provider"
+grep -q '"outcome": "success"' records/dispatch_audit.jsonl || fail "audit log missing success outcome"
+
+$WKB dispatch --topic "smoke: audit fail" --provider "bad=exit 1" >/dev/null 2>&1 || true
+[ "$(wc -l < records/dispatch_audit.jsonl)" -eq 3 ] || fail "audit log did not record the failing provider's attempt"
+grep -q '"outcome": "error"' records/dispatch_audit.jsonl || fail "audit log missing error outcome for failing provider"
+pass "dispatch -> audit log records every attempt, success and failure alike"
+
+# 15. dispatch --deny-pattern: a matching provider command is rejected
+# BEFORE it runs -- proven by a marker file the denied command would have
+# created, which must never appear. A mixed batch (one benign, one denied)
+# must also fully block, not partially run.
+denied_marker="$WORKDIR/denied_marker"
+rm -f "$denied_marker"
+deny_exit=0
+$WKB dispatch --topic "smoke: deny" \
+  --provider "danger=touch $denied_marker && echo done" \
+  --deny-pattern 'touch ' >/dev/null 2>&1 || deny_exit=$?
+[ "$deny_exit" -eq 2 ] || fail "dispatch did not exit 2 on a --deny-pattern match (got $deny_exit)"
+[ -e "$denied_marker" ] && fail "denied provider command ran anyway (marker file exists)"
+
+rm -f "$denied_marker"
+mixed_exit=0
+$WKB dispatch --topic "smoke: deny mixed" \
+  --provider "ok=echo fine" \
+  --provider "danger=touch $denied_marker" \
+  --deny-pattern 'touch ' >/dev/null 2>&1 || mixed_exit=$?
+[ "$mixed_exit" -eq 2 ] || fail "mixed batch with a denied provider did not exit 2 (got $mixed_exit)"
+[ -e "$denied_marker" ] && fail "denied provider ran even though it was one of several providers"
+pass "dispatch --deny-pattern -> rejected provider never runs, blocks whole batch"
+
+# 16. dispatch --judge: triage only runs on DISAGREE, never on AGREE (no
+# cost paid when providers already agree), and a judge that itself fails
+# degrades to triage_error instead of taking dispatch() down.
+judge_marker="$WORKDIR/judge_marker"
+
+rm -f "$judge_marker"
+$WKB dispatch --topic "smoke: judge agree" \
+  --provider "a=echo same" --provider "b=echo same" \
+  --judge "j=touch $judge_marker && echo verdict" >/dev/null
+[ -e "$judge_marker" ] && fail "judge ran on an AGREE verdict -- should never be invoked"
+
+rm -f "$judge_marker"
+judge_out=$($WKB dispatch --topic "smoke: judge disagree" \
+  --provider "a=echo one" --provider "b=echo two" \
+  --judge "j=touch $judge_marker && echo 'I side with a'")
+[ -e "$judge_marker" ] || fail "judge did not run on a DISAGREE verdict"
+echo "$judge_out" | grep -q "I side with a" || fail "triage output missing from dispatch output"
+
+judge_fail_exit=0
+$WKB dispatch --topic "smoke: judge fails" \
+  --provider "a=echo one" --provider "b=echo two" \
+  --judge "j=exit 1" >/dev/null 2>&1 || judge_fail_exit=$?
+[ "$judge_fail_exit" -eq 0 ] || fail "a failing judge took dispatch() down (exit $judge_fail_exit, expected 0 -- primary DISAGREE verdict should still stand)"
+pass "dispatch --judge -> triage runs only on DISAGREE, judge failure degrades gracefully"
+
 echo "ALL SMOKE TESTS PASSED"
