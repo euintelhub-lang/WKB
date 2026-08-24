@@ -516,7 +516,16 @@ def _run_provider(name: str, command: str, topic: str) -> Position:
     return Position(provider=name, text=text, sha=body_sha(text + "\n"))
 
 
-def dispatch(topic: str, providers: dict, on_attempt=None) -> DispatchResult:
+def dispatch(topic: str, providers: dict, on_attempt=None, validate_provider=None) -> DispatchResult:
+    # Guard runs synchronously, before any provider starts -- structural,
+    # not advisory: a rejected provider's subprocess is never spawned, and
+    # nothing here retroactively cancels a command already running. Every
+    # provider is checked up front, so a bad one is caught before any
+    # provider (good or bad) has run, not discovered mid-batch.
+    if validate_provider is not None:
+        for name, command in providers.items():
+            validate_provider(name, command)
+
     # Providers run concurrently (each is a blocking subprocess call, so
     # threads — not asyncio — buy the parallelism): wall time drops from
     # sum(provider latencies) to max(provider latencies). Results are
@@ -595,7 +604,24 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                 f.write(line + "\n")
 
     try:
-        result = dispatch(args.topic, providers, on_attempt=_log_attempt)
+        deny_patterns = [re.compile(p) for p in args.deny_pattern]
+    except re.error as e:
+        print(f"error: --deny-pattern {e.pattern!r} is not a valid regex: {e}", file=sys.stderr)
+        return 2
+
+    def _validate_provider(name: str, command: str) -> None:
+        for pattern in deny_patterns:
+            if pattern.search(command):
+                raise WkbError(
+                    f"provider '{name}' rejected: command matches --deny-pattern "
+                    f"'{pattern.pattern}' -- nothing was run"
+                )
+
+    try:
+        result = dispatch(
+            args.topic, providers,
+            on_attempt=_log_attempt, validate_provider=_validate_provider,
+        )
     except WkbError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -685,6 +711,12 @@ def build_parser() -> argparse.ArgumentParser:
     dispatch_p.add_argument("--parent", default=None, help="wkb id this dispatch is about")
     dispatch_p.add_argument("--seal", action="store_true", help="seal the result as a WKB record")
     dispatch_p.add_argument("--dir", default=str(DEFAULT_DIR))
+    dispatch_p.add_argument(
+        "--deny-pattern", action="append", default=[], metavar="REGEX",
+        help="repeatable; reject (before running anything) any --provider command "
+        "matching this regex. No patterns are built in -- provider commands are "
+        "arbitrary shell by design, so this is opt-in, not a sandbox.",
+    )
     dispatch_p.set_defaults(func=cmd_dispatch)
 
     return p

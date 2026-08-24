@@ -127,4 +127,27 @@ $WKB dispatch --topic "smoke: audit fail" --provider "bad=exit 1" >/dev/null 2>&
 grep -q '"outcome": "error"' records/dispatch_audit.jsonl || fail "audit log missing error outcome for failing provider"
 pass "dispatch -> audit log records every attempt, success and failure alike"
 
+# 15. dispatch --deny-pattern: a matching provider command is rejected
+# BEFORE it runs -- proven by a marker file the denied command would have
+# created, which must never appear. A mixed batch (one benign, one denied)
+# must also fully block, not partially run.
+denied_marker="$WORKDIR/denied_marker"
+rm -f "$denied_marker"
+deny_exit=0
+$WKB dispatch --topic "smoke: deny" \
+  --provider "danger=touch $denied_marker && echo done" \
+  --deny-pattern 'touch ' >/dev/null 2>&1 || deny_exit=$?
+[ "$deny_exit" -eq 2 ] || fail "dispatch did not exit 2 on a --deny-pattern match (got $deny_exit)"
+[ -e "$denied_marker" ] && fail "denied provider command ran anyway (marker file exists)"
+
+rm -f "$denied_marker"
+mixed_exit=0
+$WKB dispatch --topic "smoke: deny mixed" \
+  --provider "ok=echo fine" \
+  --provider "danger=touch $denied_marker" \
+  --deny-pattern 'touch ' >/dev/null 2>&1 || mixed_exit=$?
+[ "$mixed_exit" -eq 2 ] || fail "mixed batch with a denied provider did not exit 2 (got $mixed_exit)"
+[ -e "$denied_marker" ] && fail "denied provider ran even though it was one of several providers"
+pass "dispatch --deny-pattern -> rejected provider never runs, blocks whole batch"
+
 echo "ALL SMOKE TESTS PASSED"
