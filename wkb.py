@@ -43,8 +43,9 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -482,6 +483,23 @@ class DispatchResult:
     parent: str | None = None
 
 
+@dataclass
+class Attempt:
+    # One provider attempt, logged regardless of outcome -- unlike
+    # DispatchResult (only the AGREE/DISAGREE snapshot), this is the record
+    # of what actually happened: which provider ran, when, how long it
+    # took, and whether it succeeded, independent of what the other
+    # providers did or whether dispatch() ultimately raised. A provider
+    # that times out or errors still produces an Attempt; today that
+    # information is otherwise lost the moment WkbError propagates.
+    provider: str
+    started_at: str  # ISO 8601 UTC
+    duration_seconds: float
+    outcome: str  # success | error
+    sha: str | None = None
+    error: str | None = None
+
+
 def _run_provider(name: str, command: str, topic: str) -> Position:
     try:
         proc = subprocess.run(
@@ -498,7 +516,7 @@ def _run_provider(name: str, command: str, topic: str) -> Position:
     return Position(provider=name, text=text, sha=body_sha(text + "\n"))
 
 
-def dispatch(topic: str, providers: dict) -> DispatchResult:
+def dispatch(topic: str, providers: dict, on_attempt=None) -> DispatchResult:
     # Providers run concurrently (each is a blocking subprocess call, so
     # threads — not asyncio — buy the parallelism): wall time drops from
     # sum(provider latencies) to max(provider latencies). Results are
@@ -511,10 +529,28 @@ def dispatch(topic: str, providers: dict) -> DispatchResult:
     outcomes: dict[str, Position | WkbError] = {}
 
     def _worker(name: str, command: str) -> None:
+        started_at = datetime.now(timezone.utc)
+        started = time.monotonic()
         try:
-            outcomes[name] = _run_provider(name, command, topic)
+            position = _run_provider(name, command, topic)
+            outcomes[name] = position
+            attempt = Attempt(
+                provider=name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="success", sha=position.sha,
+            )
         except WkbError as e:
             outcomes[name] = e
+            attempt = Attempt(
+                provider=name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="error", error=str(e),
+            )
+        # Logged here, inside the worker, so a slow or failing provider's
+        # attempt is recorded the moment it resolves -- not batched up and
+        # lost if dispatch() raises before every thread has joined.
+        if on_attempt is not None:
+            on_attempt(attempt)
 
     threads = {
         name: threading.Thread(target=_worker, args=(name, command), daemon=True)
@@ -544,8 +580,22 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         name, _, command = spec.partition("=")
         providers[name] = command
 
+    # Every attempt is appended here as it resolves, regardless of the
+    # eventual verdict or whether dispatch() raises -- a provider that
+    # times out is still on record, which the AGREE/DISAGREE snapshot
+    # alone can never show. One audit log per --dir, shared across runs.
+    audit_path = Path(args.dir) / "dispatch_audit.jsonl"
+    audit_lock = threading.Lock()
+
+    def _log_attempt(attempt: Attempt) -> None:
+        line = json.dumps(asdict(attempt), sort_keys=True)
+        with audit_lock:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with audit_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
     try:
-        result = dispatch(args.topic, providers)
+        result = dispatch(args.topic, providers, on_attempt=_log_attempt)
     except WkbError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2

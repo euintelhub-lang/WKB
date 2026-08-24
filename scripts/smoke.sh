@@ -113,4 +113,18 @@ elapsed=$(( $(date +%s) - start ))
 [ "$elapsed" -lt 3 ] || fail "dispatch took ${elapsed}s for 3x 1s providers -- not running concurrently"
 pass "dispatch -> providers run concurrently (${elapsed}s for 3x 1s providers)"
 
+# 14. dispatch: audit log records every provider attempt, including a
+# failing one -- even though dispatch() raises and the run never reaches
+# a verdict. This is the point of the audit trail: it survives what the
+# AGREE/DISAGREE snapshot alone cannot show.
+rm -f records/dispatch_audit.jsonl
+$WKB dispatch --topic "smoke: audit ok" --provider "a=echo x" --provider "b=echo y" >/dev/null
+[ "$(wc -l < records/dispatch_audit.jsonl)" -eq 2 ] || fail "audit log did not gain one line per successful provider"
+grep -q '"outcome": "success"' records/dispatch_audit.jsonl || fail "audit log missing success outcome"
+
+$WKB dispatch --topic "smoke: audit fail" --provider "bad=exit 1" >/dev/null 2>&1 || true
+[ "$(wc -l < records/dispatch_audit.jsonl)" -eq 3 ] || fail "audit log did not record the failing provider's attempt"
+grep -q '"outcome": "error"' records/dispatch_audit.jsonl || fail "audit log missing error outcome for failing provider"
+pass "dispatch -> audit log records every attempt, success and failure alike"
+
 echo "ALL SMOKE TESTS PASSED"
