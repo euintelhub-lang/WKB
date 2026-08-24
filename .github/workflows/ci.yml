@@ -18,3 +18,21 @@ jobs:
       - run: pip install pyyaml
 
       - run: bash scripts/smoke.sh
+
+  workerpool:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+
+      - run: go build ./...
+        working-directory: workerpool
+
+      - run: go vet ./...
+        working-directory: workerpool
+
+      - run: go test ./... -race
+        working-directory: workerpool
