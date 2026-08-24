@@ -481,6 +481,8 @@ class DispatchResult:
     positions: list
     verdict: str  # AGREE | DISAGREE
     parent: str | None = None
+    triage: str | None = None  # judge's verdict, only ever set on DISAGREE
+    triage_error: str | None = None  # set instead of triage if the judge itself failed
 
 
 @dataclass
@@ -516,7 +518,22 @@ def _run_provider(name: str, command: str, topic: str) -> Position:
     return Position(provider=name, text=text, sha=body_sha(text + "\n"))
 
 
-def dispatch(topic: str, providers: dict, on_attempt=None, validate_provider=None) -> DispatchResult:
+def _build_triage_prompt(topic: str, positions: list) -> str:
+    lines = [
+        f"Topic: {topic}", "",
+        "The following providers were asked the same question and disagreed. "
+        "Weigh their positions and give your own judgment.", "",
+    ]
+    for p in positions:
+        lines.append(f"[{p.provider}]")
+        lines.append(p.text)
+        lines.append("")
+    return "\n".join(lines)
+
+
+def dispatch(
+    topic: str, providers: dict, on_attempt=None, validate_provider=None, judge=None,
+) -> DispatchResult:
     # Guard runs synchronously, before any provider starts -- structural,
     # not advisory: a rejected provider's subprocess is never spawned, and
     # nothing here retroactively cancels a command already running. Every
@@ -577,7 +594,42 @@ def dispatch(topic: str, providers: dict, on_attempt=None, validate_provider=Non
         positions.append(outcome)
 
     verdict = "AGREE" if len({p.sha for p in positions}) == 1 else "DISAGREE"
-    return DispatchResult(topic=topic, positions=positions, verdict=verdict)
+
+    # Triage is a separate pass, run only on DISAGREE -- routing on the
+    # verdict costs nothing and means an already-agreeing batch never
+    # pays for a judge call it doesn't need. The judge's own failure
+    # degrades to triage_error rather than raising: dispatch() already
+    # has a valid, checkable verdict at this point, and losing the
+    # enrichment pass shouldn't take the primary result down with it.
+    triage = None
+    triage_error = None
+    if verdict == "DISAGREE" and judge is not None:
+        judge_name, judge_command = judge
+        prompt = _build_triage_prompt(topic, positions)
+        started_at = datetime.now(timezone.utc)
+        started = time.monotonic()
+        try:
+            judge_position = _run_provider(judge_name, judge_command, prompt)
+            triage = judge_position.text
+            attempt = Attempt(
+                provider=judge_name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="success", sha=judge_position.sha,
+            )
+        except WkbError as e:
+            triage_error = str(e)
+            attempt = Attempt(
+                provider=judge_name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="error", error=str(e),
+            )
+        if on_attempt is not None:
+            on_attempt(attempt)
+
+    return DispatchResult(
+        topic=topic, positions=positions, verdict=verdict,
+        triage=triage, triage_error=triage_error,
+    )
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
@@ -617,10 +669,18 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
                     f"'{pattern.pattern}' -- nothing was run"
                 )
 
+    judge = None
+    if args.judge is not None:
+        if "=" not in args.judge:
+            print(f"error: --judge must be NAME=COMMAND, got {args.judge!r}", file=sys.stderr)
+            return 2
+        judge_name, _, judge_command = args.judge.partition("=")
+        judge = (judge_name, judge_command)
+
     try:
         result = dispatch(
             args.topic, providers,
-            on_attempt=_log_attempt, validate_provider=_validate_provider,
+            on_attempt=_log_attempt, validate_provider=_validate_provider, judge=judge,
         )
     except WkbError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -631,12 +691,21 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     for p in result.positions:
         print(f"\n[{p.provider}] sha={p.sha[:12]}...")
         print(p.text)
+    if result.triage is not None:
+        print(f"\n[triage: {judge[0]}]")
+        print(result.triage)
+    elif result.triage_error is not None:
+        print(f"\n[triage failed] {result.triage_error}", file=sys.stderr)
 
     if args.seal:
         body_lines = [f"Dispatch: {result.topic}", f"Verdict: {result.verdict}", ""]
         for p in result.positions:
             body_lines.append(f"[{p.provider}]")
             body_lines.append(p.text)
+            body_lines.append("")
+        if result.triage is not None:
+            body_lines.append(f"[triage: {judge[0]}]")
+            body_lines.append(result.triage)
             body_lines.append("")
         body = "\n".join(body_lines).rstrip("\n") + "\n"
 
@@ -716,6 +785,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="repeatable; reject (before running anything) any --provider command "
         "matching this regex. No patterns are built in -- provider commands are "
         "arbitrary shell by design, so this is opt-in, not a sandbox.",
+    )
+    dispatch_p.add_argument(
+        "--judge", default=None, metavar="NAME=COMMAND",
+        help="optional; on DISAGREE only, run this provider against all disagreeing "
+        "positions and record its verdict as triage. Never runs on AGREE, so an "
+        "already-agreeing batch never pays for a judge call it doesn't need.",
     )
     dispatch_p.set_defaults(func=cmd_dispatch)
 
