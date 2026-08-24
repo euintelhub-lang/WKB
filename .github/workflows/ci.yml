@@ -20,3 +20,5 @@ jobs:
       - run: bash scripts/smoke.sh
 
       - run: python3 scripts/test_usage_tracker.py
+
+      - run: python3 scripts/test_model_router.py
