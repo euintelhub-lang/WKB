@@ -10,6 +10,7 @@ export default function Funnel({ packs }) {
   const [history, setHistory] = useState([]);
   const [resolution, setResolution] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
 
   function reset() {
     setPack(null);
@@ -29,13 +30,19 @@ export default function Funnel({ packs }) {
 
   async function startGenerated(topic) {
     setLoading(true);
-    const generated = await generatePack(topic);
-    setPack(generated);
-    setStep(generated.firstQuestion);
-    setStepDispatch(generated.dispatch);
-    setHistory([]);
-    setResolution(null);
-    setLoading(false);
+    setError(null);
+    try {
+      const generated = await generatePack(topic);
+      setPack(generated);
+      setStep(generated.firstQuestion);
+      setStepDispatch(generated.dispatch);
+      setHistory([]);
+      setResolution(null);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
   }
 
   async function answer(value) {
@@ -55,14 +62,20 @@ export default function Funnel({ packs }) {
     const nextHistory = [...history, { question: step, answer: value }];
     setHistory(nextHistory);
     setLoading(true);
-    const result = await askNext(pack, nextHistory);
-    setLoading(false);
-    if (result.done) {
-      setResolution({ ...result.resolution, dispatch: result.dispatch });
-      setStep(null);
-    } else {
-      setStep(result.question);
-      setStepDispatch(result.dispatch);
+    setError(null);
+    try {
+      const result = await askNext(pack, nextHistory);
+      if (result.done) {
+        setResolution({ ...result.resolution, dispatch: result.dispatch });
+        setStep(null);
+      } else {
+        setStep(result.question);
+        setStepDispatch(result.dispatch);
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -71,12 +84,13 @@ export default function Funnel({ packs }) {
   }
 
   if (pack && step) {
+    const questionText = pack.verified ? pack.questions[step]?.text : step;
     return (
       <div className="question-box">
         <div className="funnel-header">
           <VerifiedBadge verified={pack.verified} verdict={stepDispatch?.verdict} />
         </div>
-        <p className="question-text">{step.text ?? step}</p>
+        <p className="question-text">{questionText}</p>
         <div className="yes-no-row">
           <button className="yes" onClick={() => answer(true)} disabled={loading}>
             Да
@@ -86,12 +100,14 @@ export default function Funnel({ packs }) {
           </button>
         </div>
         {loading && <p className="loading">Зареждане на следваща стъпка…</p>}
+        {error && <p className="error">Грешка: {error}</p>}
       </div>
     );
   }
 
   return (
     <div className="pack-list">
+      {error && <p className="error">Грешка: {error}</p>}
       {packs.map((p) => (
         <button key={p.id} className="pack-card" onClick={() => startVerified(p)}>
           <div className="pack-card-title">
