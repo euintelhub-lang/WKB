@@ -6,14 +6,20 @@ Companion to usage_tracker.py: `choose_model` decides which model to call;
 router's output tied to `MODEL_PRICING` means a route can never point at a
 model this tracker doesn't know how to price.
 
-Two bugs fixed from the snippet this was built from:
-  - `claude-haiku-4-5-20251001` is not a real model id. Anthropic model
-    strings are undated aliases (`claude-haiku-4-5`) — appending a date
-    suffix like a training-data-era snapshot name gets a 404 from the API,
-    not a specific dated model.
-  - it mixed model generations (Haiku *4.5* alongside Sonnet/Opus *4.6*).
-    Routes now stay within the current generation (Haiku 4.5, Sonnet 5,
-    Opus 5) for a consistent quality-per-tier ladder.
+One real bug fixed from the snippet this was built from: it mixed model
+generations (Haiku *4.5* alongside Sonnet/Opus *4.6*). Routes now stay
+within the current generation (Haiku 4.5, Sonnet 5, Opus 5) for a
+consistent quality-per-tier ladder.
+
+Note on `claude-haiku-4-5-20251001` vs `claude-haiku-4-5`: an earlier
+draft of this file called the dated form invalid — that was wrong.
+Per the live models table (platform.claude.com/docs/en/about-claude/
+models/overview, checked 2026-08-27), `claude-haiku-4-5-20251001` is
+the actual pinned Claude API ID for Haiku 4.5 (it predates the dateless
+snapshot convention that started with the 4.6 generation); `claude-
+haiku-4-5` is a convenience alias that resolves to the same snapshot.
+Both work. This module uses the alias for consistency with the other
+current-gen ids below, which are dateless by construction.
 """
 
 from usage_tracker import MODEL_PRICING
