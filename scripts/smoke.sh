@@ -17,7 +17,7 @@ fail() { echo "FAIL: $1" >&2; exit 1; }
 extract_id() { grep -oE 'id=[a-z0-9-]+' | cut -d= -f2; }
 
 # 1. seal + check a simple record
-out=$($WKB seal --type decision --topic "smoke: simple" --body "kratko tqlo")
+out=$($WKB seal --agent smoke-test --type report --topic "smoke: simple" --body "kratko tqlo")
 id=$(echo "$out" | extract_id)
 $WKB check "records/$id.md" | grep -q "^PASS" || fail "check did not PASS a freshly sealed record"
 pass "seal + check"
@@ -27,10 +27,10 @@ $WKB bridge "records/$id.md" --target json | grep -q "^status: SUCCESS" || fail 
 pass "bridge json -> SUCCESS"
 
 # 3. bridge --target csv with 2 parents + long multiline body -> DEGRADED, 3 reasons
-out2=$($WKB seal --type decision --topic "smoke: child A" --body "a")
+out2=$($WKB seal --agent smoke-test --type report --topic "smoke: child A" --body "a")
 id2=$(echo "$out2" | extract_id)
 long_body=$(python3 -c "print('line of text.\n' * 15, end='')")
-out3=$($WKB seal --type observation --topic "smoke: multi-parent" \
+out3=$($WKB seal --agent smoke-test --type extraction --topic "smoke: multi-parent" \
   --parent "$id" --parent "$id2" --raw "provenance note" --body "$long_body")
 id3=$(echo "$out3" | extract_id)
 
@@ -59,7 +59,7 @@ $WKB ls | grep -q "$id" || fail "ls is missing a sealed record"
 pass "ls"
 
 # 7. bridge --target restore: two-hop parent chain -> SUCCESS, lineage in order
-out4=$($WKB seal --type decision --topic "restore: child" --parent "$id3" --body "restore target smoke test")
+out4=$($WKB seal --agent smoke-test --type report --topic "restore: child" --parent "$id3" --body "restore target smoke test")
 id4=$(echo "$out4" | extract_id)
 restore_result=$($WKB bridge "records/$id4.md" --target restore)
 echo "$restore_result" | grep -q "^status: SUCCESS" || fail "restore bridge (full chain) was not SUCCESS"
@@ -69,7 +69,7 @@ echo "$restore_result" | grep -q "\[$id3\]" || fail "restore bridge lineage is m
 pass "bridge restore -> SUCCESS (3-node lineage resolved)"
 
 # 8. bridge --target restore: missing parent -> DEGRADED, LOSSY_ENCODING
-out5=$($WKB seal --type decision --topic "restore: orphan" --parent "wkb-20260101-dead" --body "parent was never sealed")
+out5=$($WKB seal --agent smoke-test --type report --topic "restore: orphan" --parent "wkb-20260101-dead" --body "parent was never sealed")
 id5=$(echo "$out5" | extract_id)
 orphan_result=$($WKB bridge "records/$id5.md" --target restore)
 echo "$orphan_result" | grep -q "^status: DEGRADED" || fail "restore bridge (missing parent) was not DEGRADED"
