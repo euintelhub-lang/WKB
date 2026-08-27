@@ -21,12 +21,10 @@ Two bugs in the snippet this was built from, fixed here:
   - cache_read/cache_creation tokens were tallied but never billed, even
     though they carry their own (much cheaper / slightly pricier) rate.
 
-Pricing source: claude.com/pricing, standard (non-intro) rates as of
-2026-08. Sonnet 5 carries a temporary intro rate ($2/$10 per MTok)
-through 2026-08-31 — deliberately not used as the default here since it
-would make this table wrong the day it expires; pass a lower rate
-explicitly via MODEL_PRICING if you need to price against the intro
-window.
+Pricing source: claude.com/pricing rates as of 2026-08 (Sonnet 5 is
+$2/$10 per MTok — the current listed rate, not a discounted intro rate
+as an earlier draft of this file assumed). If that rate changes after
+2026-08-31, update this table then; don't pre-guess a future price now.
 """
 
 from dataclasses import dataclass, field as dataclass_field
@@ -40,7 +38,7 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
     "claude-opus-4-8": (5.00, 25.00),
     "claude-opus-4-7": (5.00, 25.00),
     "claude-opus-4-6": (5.00, 25.00),
-    "claude-sonnet-5": (3.00, 15.00),
+    "claude-sonnet-5": (2.00, 10.00),
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-haiku-4-5": (1.00, 5.00),
 }
