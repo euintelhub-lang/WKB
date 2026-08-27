@@ -175,4 +175,32 @@ $WKB dispatch --topic "smoke: judge fails" \
 [ "$judge_fail_exit" -eq 0 ] || fail "a failing judge took dispatch() down (exit $judge_fail_exit, expected 0 -- primary DISAGREE verdict should still stand)"
 pass "dispatch --judge -> triage runs only on DISAGREE, judge failure degrades gracefully"
 
+# 17. dispatch --judge: structured VERDICT/CONFIDENCE parsing. A
+# well-formed judge response is parsed into a routable verdict; a judge
+# that names a provider outside this batch, or an out-of-range
+# confidence, or plain free text with no VERDICT/CONFIDENCE lines at
+# all, must all degrade to UNPARSED rather than being trusted or crashing
+# -- the raw triage text stays readable in every case.
+well_formed_out=$($WKB dispatch --topic "smoke: triage parse ok" \
+  --provider "a=echo one" --provider "b=echo two" \
+  --judge 'j=printf "VERDICT: a\nCONFIDENCE: 0.85\nreasoning here\n"')
+echo "$well_formed_out" | grep -q "verdict=a confidence=0.85" || fail "well-formed judge output was not parsed into a structured verdict"
+
+bad_verdict_out=$($WKB dispatch --topic "smoke: triage parse bad verdict" \
+  --provider "a=echo one" --provider "b=echo two" \
+  --judge 'j=printf "VERDICT: nonexistent\nCONFIDENCE: 0.9\nreasoning\n"')
+echo "$bad_verdict_out" | grep -q "verdict=UNPARSED" || fail "judge naming a provider outside the batch was not rejected as UNPARSED"
+
+bad_confidence_out=$($WKB dispatch --topic "smoke: triage parse bad confidence" \
+  --provider "a=echo one" --provider "b=echo two" \
+  --judge 'j=printf "VERDICT: a\nCONFIDENCE: 1.5\nreasoning\n"')
+echo "$bad_confidence_out" | grep -q "verdict=UNPARSED" || fail "out-of-range confidence was not rejected as UNPARSED"
+
+free_text_out=$($WKB dispatch --topic "smoke: triage parse free text" \
+  --provider "a=echo one" --provider "b=echo two" \
+  --judge "j=echo 'no structured format here'")
+echo "$free_text_out" | grep -q "verdict=UNPARSED" || fail "free-text judge response was not marked UNPARSED"
+echo "$free_text_out" | grep -q "no structured format here" || fail "raw triage text was lost on an UNPARSED response"
+pass "dispatch --judge -> structured VERDICT/CONFIDENCE parsed strictly, degrades to UNPARSED otherwise"
+
 echo "ALL SMOKE TESTS PASSED"

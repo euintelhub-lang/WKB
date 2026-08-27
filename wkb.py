@@ -552,8 +552,16 @@ class DispatchResult:
     positions: list
     verdict: str  # AGREE | DISAGREE
     parent: str | None = None
-    triage: str | None = None  # judge's verdict, only ever set on DISAGREE
+    triage: str | None = None  # judge's raw response text, only ever set on DISAGREE
     triage_error: str | None = None  # set instead of triage if the judge itself failed
+    # Structured reading of `triage`, mirroring the ecosystem repo's
+    # triangulation-orchestrator (confidence-graded consensus, not a flat
+    # binary). Both stay None whenever the judge didn't follow the
+    # VERDICT/CONFIDENCE format -- degraded, not guessed: `triage` (raw
+    # text) is still there to read by hand, same as ecosystem's own
+    # "semantic: not automated here, read manually" fallback.
+    triage_verdict: str | None = None  # a provider name from this batch, or "UNRESOLVED"
+    triage_confidence: float | None = None  # 0.0-1.0
 
 
 @dataclass
@@ -589,7 +597,12 @@ def _run_provider(name: str, command: str, topic: str) -> Position:
     return Position(provider=name, text=text, sha=body_sha(text + "\n"))
 
 
+TRIAGE_VERDICT_RE = re.compile(r"(?im)^\s*VERDICT:\s*(\S+)\s*$")
+TRIAGE_CONFIDENCE_RE = re.compile(r"(?im)^\s*CONFIDENCE:\s*([0-9.]+)\s*$")
+
+
 def _build_triage_prompt(topic: str, positions: list) -> str:
+    provider_names = "|".join(p.provider for p in positions)
     lines = [
         f"Topic: {topic}", "",
         "The following providers were asked the same question and disagreed. "
@@ -599,7 +612,40 @@ def _build_triage_prompt(topic: str, positions: list) -> str:
         lines.append(f"[{p.provider}]")
         lines.append(p.text)
         lines.append("")
+    lines += [
+        "Respond with exactly these two lines first, then your reasoning:",
+        f"VERDICT: <{provider_names}|UNRESOLVED>",
+        "CONFIDENCE: <a number from 0.0 to 1.0>",
+    ]
     return "\n".join(lines)
+
+
+def _parse_triage(text: str, positions: list) -> tuple[str | None, float | None]:
+    # Deliberately strict: a verdict that isn't one of this batch's actual
+    # provider names (or the literal UNRESOLVED) is not trustworthy enough
+    # to route on, and an out-of-range confidence is the same kind of
+    # malformed input `check` already refuses to guess through elsewhere
+    # in this file. Either failure degrades to (None, None) -- the raw
+    # `triage` text is still kept by the caller, so nothing is lost, only
+    # left unstructured.
+    verdict_match = TRIAGE_VERDICT_RE.search(text)
+    confidence_match = TRIAGE_CONFIDENCE_RE.search(text)
+    if not verdict_match or not confidence_match:
+        return None, None
+
+    verdict = verdict_match.group(1)
+    valid_verdicts = {p.provider for p in positions} | {"UNRESOLVED"}
+    if verdict not in valid_verdicts:
+        return None, None
+
+    try:
+        confidence = float(confidence_match.group(1))
+    except ValueError:
+        return None, None
+    if not (0.0 <= confidence <= 1.0):
+        return None, None
+
+    return verdict, confidence
 
 
 def dispatch(
@@ -674,6 +720,8 @@ def dispatch(
     # enrichment pass shouldn't take the primary result down with it.
     triage = None
     triage_error = None
+    triage_verdict = None
+    triage_confidence = None
     if verdict == "DISAGREE" and judge is not None:
         judge_name, judge_command = judge
         prompt = _build_triage_prompt(topic, positions)
@@ -682,6 +730,7 @@ def dispatch(
         try:
             judge_position = _run_provider(judge_name, judge_command, prompt)
             triage = judge_position.text
+            triage_verdict, triage_confidence = _parse_triage(triage, positions)
             attempt = Attempt(
                 provider=judge_name, started_at=started_at.isoformat(),
                 duration_seconds=time.monotonic() - started,
@@ -700,6 +749,7 @@ def dispatch(
     return DispatchResult(
         topic=topic, positions=positions, verdict=verdict,
         triage=triage, triage_error=triage_error,
+        triage_verdict=triage_verdict, triage_confidence=triage_confidence,
     )
 
 
@@ -764,6 +814,10 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         print(p.text)
     if result.triage is not None:
         print(f"\n[triage: {judge[0]}]")
+        if result.triage_verdict is not None:
+            print(f"verdict={result.triage_verdict} confidence={result.triage_confidence:.2f}")
+        else:
+            print("verdict=UNPARSED (judge didn't follow the VERDICT/CONFIDENCE format)")
         print(result.triage)
     elif result.triage_error is not None:
         print(f"\n[triage failed] {result.triage_error}", file=sys.stderr)
@@ -776,6 +830,12 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
             body_lines.append("")
         if result.triage is not None:
             body_lines.append(f"[triage: {judge[0]}]")
+            if result.triage_verdict is not None:
+                body_lines.append(
+                    f"verdict={result.triage_verdict} confidence={result.triage_confidence:.2f}"
+                )
+            else:
+                body_lines.append("verdict=UNPARSED")
             body_lines.append(result.triage)
             body_lines.append("")
         body = "\n".join(body_lines).rstrip("\n") + "\n"
