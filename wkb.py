@@ -1,37 +1,60 @@
 #!/usr/bin/env python3
-"""wkb.py — reference implementation of the WKB v1.2 minimal record schema.
+"""wkb.py — reference implementation of the WKB record schema.
 
-Built from the schema reconstructed out of Google Drive material:
-  - wkb-20260727-b7e2 (critique that produced v1.2: YAML is the source of
-    truth, emoji is only a render; parent must be a real id, not free text;
-    sha is a real checksum on the body; regime is state@source or absent)
-  - the WKBE dialog log (interpretation enum added 2026-08-16)
+Conforms to euintelhub-lang/ecosystem's `contracts/agent-output.schema.yaml`
+(schema v1.0) — the actual, machine-checked contract that ecosystem's CI
+(`validate-schema` job / `scripts/validate_logs.py`) enforces. The required
+core is exactly that schema's required fields:
 
-Four commands: check, seal, ls (named in the dialog log), plus bridge —
-the BridgeResult contract added 2026-08-16 (SUCCESS/DEGRADED/FAILED,
-dropped_fields with a reason, generic fallback for unknown targets).
+    agent           — which agent produced this record
+    schema_version  — "1.0" (pattern \\d+\\.\\d+), per contracts/schema-versioning.yaml
+    timestamp       — ISO 8601 with timezone
+    type            — closed enum: extraction, classification, alert, report, sync
+    status          — closed enum: SUCCESS, PARTIAL, FAILED
+
+Earlier versions of this file (WKB v1.2, PRs #2-#6) used a different,
+unrelated field set (`wkb`, `id`, `type` as free text, `status` defaulting
+to "pending") reconstructed from a Google Drive dialog log — it never
+matched what ecosystem's own contracts actually require. This rewrite
+replaces that schema with ecosystem's real one.
+
+`agent-output.schema.yaml` allows extra fields beyond its own list
+(`extra_unknown_fields: WARNING`, not FAILED) — so the genuinely useful
+mechanics from the old schema are kept as WKB-specific extensions on top
+of the required core, not replacements for it:
+
+    id              — wkb-YYYYMMDD-xxxx, this record's own identifier
+    parent          — list of ancestor wkb ids (validated), for the DAG
+                       `bridge --target restore` walks
+    interpretation  — "" / rumen_only / claude_only / consensus — tracks
+                       whether/how a record's content has been resolved
+                       (this is the old "pending" concept's real home;
+                       `status` now means agent-execution outcome instead)
+    topic           — one-line human summary
+    sha             — sha256 of the body, checked by `check`/`bridge`
+    regime          — optional `state@source`, unrelated to a source's
+                       provenance if no "@" is present (rejected outright)
+    raw             — optional free-text provenance note
+    source          — ecosystem's own optional field, reused as-is
+
+Five commands: seal, check, ls, bridge, dispatch.
 
 Record format: a Markdown file with a YAML frontmatter header (delimited
 by '---' lines), followed by a free-text body.
 
     ---
-    wkb: "1.2"
+    agent: wkb-cli
+    schema_version: "1.0"
+    timestamp: "2026-08-23T19:30:00+00:00"
+    type: report
+    status: SUCCESS
     id: wkb-20260823-a1b2
-    type: decision
-    status: pending
     parent: []
     interpretation: ""
     topic: "..."
     sha: "<sha256 of the body>"
     ---
     Body text goes here.
-
-Known gaps, left unfilled rather than guessed:
-  - The emoji legend (which symbol renders which field) was never
-    captured as text anywhere in Drive — only UI labels survived. This
-    implementation is YAML-only; no emoji rendering.
-  - The full v1.0 canonical `type`/`status` enums were never recovered.
-    Both are free-form strings here, not validated against a closed set.
 """
 
 import argparse
@@ -42,17 +65,25 @@ import json
 import re
 import subprocess
 import sys
+import threading
+import time
 import uuid
-from dataclasses import dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass, field as dataclass_field
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import yaml
 
-WKB_VERSION = "1.2"
+SCHEMA_VERSION = "1.0"
 ID_RE = re.compile(r"^wkb-(\d{8})-([0-9a-f]{4})$")
+TYPE_VALUES = {"extraction", "classification", "alert", "report", "sync"}
+STATUS_VALUES = {"SUCCESS", "PARTIAL", "FAILED"}
 INTERPRETATION_VALUES = {"", "rumen_only", "claude_only", "consensus"}
 DEFAULT_DIR = Path("records")
+
+# Fields this tool requires beyond ecosystem's own required core — WKB's
+# extensions, not part of agent-output.schema.yaml itself.
+WKB_REQUIRED_EXTENSIONS = ("id", "topic", "sha")
 
 
 class WkbError(Exception):
@@ -72,13 +103,23 @@ def validate_id(value: str, field: str) -> None:
         )
 
 
+def validate_type(value: str) -> None:
+    if value not in TYPE_VALUES:
+        raise WkbError(f"invalid_enum_value: type '{value}' not in {sorted(TYPE_VALUES)}")
+
+
+def validate_status(value: str) -> None:
+    if value not in STATUS_VALUES:
+        raise WkbError(f"invalid_enum_value: status '{value}' not in {sorted(STATUS_VALUES)}")
+
+
 def validate_regime(value: str) -> None:
-    # Defect #4 from the v1.2 critique: a regime without a stated origin
-    # (the part after '@') is not allowed to exist at all.
+    # A regime without a stated origin (the part after '@') is not
+    # allowed to exist at all — same rule as the old v1.2 schema.
     if value and "@" not in value:
         raise WkbError(
             f"regime: '{value}' has no '@source' — "
-            "regime without provenance is not a field, per v1.2 decision"
+            "regime without provenance is not a field"
         )
 
 
@@ -91,11 +132,14 @@ def validate_interpretation(value: str) -> None:
 
 def split_record(text: str) -> tuple[dict, str]:
     if not text.startswith("---"):
-        raise WkbError("record has no YAML frontmatter (must start with '---')")
+        raise WkbError("unparseable_yaml: record has no YAML frontmatter (must start with '---')")
     parts = text.split("---", 2)
     if len(parts) < 3:
-        raise WkbError("record frontmatter is not closed with a second '---'")
-    header = yaml.safe_load(parts[1]) or {}
+        raise WkbError("unparseable_yaml: record frontmatter is not closed with a second '---'")
+    try:
+        header = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError as e:
+        raise WkbError(f"unparseable_yaml: {e}")
     body = parts[2].lstrip("\n")
     return header, body
 
@@ -114,13 +158,13 @@ def body_sha(body: str) -> str:
 # contract + generic fallback." Closed enum SUCCESS/DEGRADED/FAILED.
 # dropped_fields carries a reason (NO_TARGET_EQUIVALENT / LOSSY_ENCODING /
 # CONSTRAINT_EXCEEDED). acceptable is never auto-filled — a human decides.
-# Unknown target_format falls back to the 9 core fields, raw, untranslated,
+# Unknown target_format falls back to the core fields, raw, untranslated,
 # marked DEGRADED.
 
 CORE_FIELDS = (
-    "wkb", "id", "type", "status", "parent",
-    "interpretation", "topic", "sha", "regime",
-)  # the 9 fields from the v1.2 critique (regime is the one that's optional)
+    "agent", "schema_version", "timestamp", "type", "status",
+    "id", "parent", "interpretation", "topic", "sha", "regime",
+)
 
 REASON_NO_TARGET_EQUIVALENT = "NO_TARGET_EQUIVALENT"
 REASON_LOSSY_ENCODING = "LOSSY_ENCODING"
@@ -187,8 +231,6 @@ def _resolve_parent_chain(
 def _bridge_to_restore(header: dict, body: str, records_dir: Path | None = None) -> BridgeResult:
     # Real semantic translation: a natural-language briefing a fresh LLM
     # session can restore from — not a structural re-encoding of fields.
-    # This is what the WKBE dialog log calls the "Semantic Engine," and
-    # walking `parent` here is what finally gives the DAG a consumer.
     chain, missing = _resolve_parent_chain(header, records_dir or Path("."))
 
     lines = ["# WKB restore — context for a new LLM session", ""]
@@ -204,6 +246,7 @@ def _bridge_to_restore(header: dict, body: str, records_dir: Path | None = None)
 
     lines.append("## Current record")
     lines.append(f"[{header.get('id')}] ({header.get('type')}, {header.get('status')})")
+    lines.append(f"Agent: {header.get('agent')}")
     lines.append(f"Topic: {header.get('topic')}")
     interp = header.get("interpretation") or ""
     lines.append(f"Interpretation: {INTERPRETATION_PROSE.get(interp, interp)}")
@@ -335,18 +378,24 @@ def cmd_seal(args: argparse.Namespace) -> int:
         validate_id(p, "parent")
     validate_regime(args.regime or "")
     validate_interpretation(args.interpretation)
+    validate_type(args.type)
+    validate_status(args.status)
 
     record_id = make_id()
     header = {
-        "wkb": WKB_VERSION,
-        "id": record_id,
+        "agent": args.agent,
+        "schema_version": SCHEMA_VERSION,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "type": args.type,
         "status": args.status,
+        "id": record_id,
         "parent": parents,
         "interpretation": args.interpretation,
         "topic": args.topic,
         "sha": body_sha(body),
     }
+    if args.source:
+        header["source"] = args.source
     if args.regime:
         header["regime"] = args.regime
     if args.raw:
@@ -372,9 +421,33 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"FAIL {path}: {e}")
         return 1
 
-    for field in ("wkb", "id", "type", "status", "topic", "sha"):
+    # ecosystem's required core (contracts/agent-output.schema.yaml)
+    for field in ("agent", "schema_version", "timestamp", "type", "status"):
         if field not in header:
-            problems.append(f"missing required field: {field}")
+            problems.append(f"missing_required_field: {field}")
+
+    # WKB's own required extensions on top of that core
+    for field in WKB_REQUIRED_EXTENSIONS:
+        if field not in header:
+            problems.append(f"missing_required_field: {field}")
+
+    if "schema_version" in header and header["schema_version"] != SCHEMA_VERSION:
+        problems.append(
+            f"unknown_schema_version: '{header['schema_version']}' "
+            f"(this tool only validates against {SCHEMA_VERSION})"
+        )
+
+    if "type" in header:
+        try:
+            validate_type(header["type"])
+        except WkbError as e:
+            problems.append(str(e))
+
+    if "status" in header:
+        try:
+            validate_status(header["status"])
+        except WkbError as e:
+            problems.append(str(e))
 
     if "id" in header:
         try:
@@ -444,8 +517,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
         flag = "" if err is None else f"  [{err}]"
         print(
             f"{header.get('id', name):24} "
-            f"{header.get('type', '?'):12} "
-            f"{header.get('status', '?'):10} "
+            f"{header.get('type', '?'):14} "
+            f"{header.get('status', '?'):8} "
             f"{header.get('topic', '')}{flag}"
         )
     return 0
@@ -479,6 +552,33 @@ class DispatchResult:
     positions: list
     verdict: str  # AGREE | DISAGREE
     parent: str | None = None
+    triage: str | None = None  # judge's raw response text, only ever set on DISAGREE
+    triage_error: str | None = None  # set instead of triage if the judge itself failed
+    # Structured reading of `triage`, mirroring the ecosystem repo's
+    # triangulation-orchestrator (confidence-graded consensus, not a flat
+    # binary). Both stay None whenever the judge didn't follow the
+    # VERDICT/CONFIDENCE format -- degraded, not guessed: `triage` (raw
+    # text) is still there to read by hand, same as ecosystem's own
+    # "semantic: not automated here, read manually" fallback.
+    triage_verdict: str | None = None  # a provider name from this batch, or "UNRESOLVED"
+    triage_confidence: float | None = None  # 0.0-1.0
+
+
+@dataclass
+class Attempt:
+    # One provider attempt, logged regardless of outcome -- unlike
+    # DispatchResult (only the AGREE/DISAGREE snapshot), this is the record
+    # of what actually happened: which provider ran, when, how long it
+    # took, and whether it succeeded, independent of what the other
+    # providers did or whether dispatch() ultimately raised. A provider
+    # that times out or errors still produces an Attempt; today that
+    # information is otherwise lost the moment WkbError propagates.
+    provider: str
+    started_at: str  # ISO 8601 UTC
+    duration_seconds: float
+    outcome: str  # success | error
+    sha: str | None = None
+    error: str | None = None
 
 
 def _run_provider(name: str, command: str, topic: str) -> Position:
@@ -497,10 +597,160 @@ def _run_provider(name: str, command: str, topic: str) -> Position:
     return Position(provider=name, text=text, sha=body_sha(text + "\n"))
 
 
-def dispatch(topic: str, providers: dict) -> DispatchResult:
-    positions = [_run_provider(name, command, topic) for name, command in providers.items()]
+TRIAGE_VERDICT_RE = re.compile(r"(?im)^\s*VERDICT:\s*(\S+)\s*$")
+TRIAGE_CONFIDENCE_RE = re.compile(r"(?im)^\s*CONFIDENCE:\s*([0-9.]+)\s*$")
+
+
+def _build_triage_prompt(topic: str, positions: list) -> str:
+    provider_names = "|".join(p.provider for p in positions)
+    lines = [
+        f"Topic: {topic}", "",
+        "The following providers were asked the same question and disagreed. "
+        "Weigh their positions and give your own judgment.", "",
+    ]
+    for p in positions:
+        lines.append(f"[{p.provider}]")
+        lines.append(p.text)
+        lines.append("")
+    lines += [
+        "Respond with exactly these two lines first, then your reasoning:",
+        f"VERDICT: <{provider_names}|UNRESOLVED>",
+        "CONFIDENCE: <a number from 0.0 to 1.0>",
+    ]
+    return "\n".join(lines)
+
+
+def _parse_triage(text: str, positions: list) -> tuple[str | None, float | None]:
+    # Deliberately strict: a verdict that isn't one of this batch's actual
+    # provider names (or the literal UNRESOLVED) is not trustworthy enough
+    # to route on, and an out-of-range confidence is the same kind of
+    # malformed input `check` already refuses to guess through elsewhere
+    # in this file. Either failure degrades to (None, None) -- the raw
+    # `triage` text is still kept by the caller, so nothing is lost, only
+    # left unstructured.
+    verdict_match = TRIAGE_VERDICT_RE.search(text)
+    confidence_match = TRIAGE_CONFIDENCE_RE.search(text)
+    if not verdict_match or not confidence_match:
+        return None, None
+
+    verdict = verdict_match.group(1)
+    valid_verdicts = {p.provider for p in positions} | {"UNRESOLVED"}
+    if verdict not in valid_verdicts:
+        return None, None
+
+    try:
+        confidence = float(confidence_match.group(1))
+    except ValueError:
+        return None, None
+    if not (0.0 <= confidence <= 1.0):
+        return None, None
+
+    return verdict, confidence
+
+
+def dispatch(
+    topic: str, providers: dict, on_attempt=None, validate_provider=None, judge=None,
+) -> DispatchResult:
+    # Guard runs synchronously, before any provider starts -- structural,
+    # not advisory: a rejected provider's subprocess is never spawned, and
+    # nothing here retroactively cancels a command already running. Every
+    # provider is checked up front, so a bad one is caught before any
+    # provider (good or bad) has run, not discovered mid-batch.
+    if validate_provider is not None:
+        for name, command in providers.items():
+            validate_provider(name, command)
+
+    # Providers run concurrently (each is a blocking subprocess call, so
+    # threads — not asyncio — buy the parallelism): wall time drops from
+    # sum(provider latencies) to max(provider latencies). Results are
+    # collected in `providers`' declaration order, and a failing
+    # provider's error surfaces as soon as its own thread joins, without
+    # waiting on slower providers still in flight. Threads are daemons so
+    # a still-running provider (up to PROVIDER_TIMEOUT_SECONDS) can never
+    # delay process exit on the error path — ThreadPoolExecutor can't give
+    # that guarantee, since its workers aren't daemon threads.
+    outcomes: dict[str, Position | WkbError] = {}
+
+    def _worker(name: str, command: str) -> None:
+        started_at = datetime.now(timezone.utc)
+        started = time.monotonic()
+        try:
+            position = _run_provider(name, command, topic)
+            outcomes[name] = position
+            attempt = Attempt(
+                provider=name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="success", sha=position.sha,
+            )
+        except WkbError as e:
+            outcomes[name] = e
+            attempt = Attempt(
+                provider=name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="error", error=str(e),
+            )
+        # Logged here, inside the worker, so a slow or failing provider's
+        # attempt is recorded the moment it resolves -- not batched up and
+        # lost if dispatch() raises before every thread has joined.
+        if on_attempt is not None:
+            on_attempt(attempt)
+
+    threads = {
+        name: threading.Thread(target=_worker, args=(name, command), daemon=True)
+        for name, command in providers.items()
+    }
+    for t in threads.values():
+        t.start()
+
+    positions = []
+    for name, t in threads.items():
+        t.join()
+        outcome = outcomes[name]
+        if isinstance(outcome, WkbError):
+            raise outcome
+        positions.append(outcome)
+
     verdict = "AGREE" if len({p.sha for p in positions}) == 1 else "DISAGREE"
-    return DispatchResult(topic=topic, positions=positions, verdict=verdict)
+
+    # Triage is a separate pass, run only on DISAGREE -- routing on the
+    # verdict costs nothing and means an already-agreeing batch never
+    # pays for a judge call it doesn't need. The judge's own failure
+    # degrades to triage_error rather than raising: dispatch() already
+    # has a valid, checkable verdict at this point, and losing the
+    # enrichment pass shouldn't take the primary result down with it.
+    triage = None
+    triage_error = None
+    triage_verdict = None
+    triage_confidence = None
+    if verdict == "DISAGREE" and judge is not None:
+        judge_name, judge_command = judge
+        prompt = _build_triage_prompt(topic, positions)
+        started_at = datetime.now(timezone.utc)
+        started = time.monotonic()
+        try:
+            judge_position = _run_provider(judge_name, judge_command, prompt)
+            triage = judge_position.text
+            triage_verdict, triage_confidence = _parse_triage(triage, positions)
+            attempt = Attempt(
+                provider=judge_name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="success", sha=judge_position.sha,
+            )
+        except WkbError as e:
+            triage_error = str(e)
+            attempt = Attempt(
+                provider=judge_name, started_at=started_at.isoformat(),
+                duration_seconds=time.monotonic() - started,
+                outcome="error", error=str(e),
+            )
+        if on_attempt is not None:
+            on_attempt(attempt)
+
+    return DispatchResult(
+        topic=topic, positions=positions, verdict=verdict,
+        triage=triage, triage_error=triage_error,
+        triage_verdict=triage_verdict, triage_confidence=triage_confidence,
+    )
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
@@ -512,8 +762,47 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
         name, _, command = spec.partition("=")
         providers[name] = command
 
+    # Every attempt is appended here as it resolves, regardless of the
+    # eventual verdict or whether dispatch() raises -- a provider that
+    # times out is still on record, which the AGREE/DISAGREE snapshot
+    # alone can never show. One audit log per --dir, shared across runs.
+    audit_path = Path(args.dir) / "dispatch_audit.jsonl"
+    audit_lock = threading.Lock()
+
+    def _log_attempt(attempt: Attempt) -> None:
+        line = json.dumps(asdict(attempt), sort_keys=True)
+        with audit_lock:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            with audit_path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+
     try:
-        result = dispatch(args.topic, providers)
+        deny_patterns = [re.compile(p) for p in args.deny_pattern]
+    except re.error as e:
+        print(f"error: --deny-pattern {e.pattern!r} is not a valid regex: {e}", file=sys.stderr)
+        return 2
+
+    def _validate_provider(name: str, command: str) -> None:
+        for pattern in deny_patterns:
+            if pattern.search(command):
+                raise WkbError(
+                    f"provider '{name}' rejected: command matches --deny-pattern "
+                    f"'{pattern.pattern}' -- nothing was run"
+                )
+
+    judge = None
+    if args.judge is not None:
+        if "=" not in args.judge:
+            print(f"error: --judge must be NAME=COMMAND, got {args.judge!r}", file=sys.stderr)
+            return 2
+        judge_name, _, judge_command = args.judge.partition("=")
+        judge = (judge_name, judge_command)
+
+    try:
+        result = dispatch(
+            args.topic, providers,
+            on_attempt=_log_attempt, validate_provider=_validate_provider, judge=judge,
+        )
     except WkbError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -523,12 +812,31 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     for p in result.positions:
         print(f"\n[{p.provider}] sha={p.sha[:12]}...")
         print(p.text)
+    if result.triage is not None:
+        print(f"\n[triage: {judge[0]}]")
+        if result.triage_verdict is not None:
+            print(f"verdict={result.triage_verdict} confidence={result.triage_confidence:.2f}")
+        else:
+            print("verdict=UNPARSED (judge didn't follow the VERDICT/CONFIDENCE format)")
+        print(result.triage)
+    elif result.triage_error is not None:
+        print(f"\n[triage failed] {result.triage_error}", file=sys.stderr)
 
     if args.seal:
         body_lines = [f"Dispatch: {result.topic}", f"Verdict: {result.verdict}", ""]
         for p in result.positions:
             body_lines.append(f"[{p.provider}]")
             body_lines.append(p.text)
+            body_lines.append("")
+        if result.triage is not None:
+            body_lines.append(f"[triage: {judge[0]}]")
+            if result.triage_verdict is not None:
+                body_lines.append(
+                    f"verdict={result.triage_verdict} confidence={result.triage_confidence:.2f}"
+                )
+            else:
+                body_lines.append("verdict=UNPARSED")
+            body_lines.append(result.triage)
             body_lines.append("")
         body = "\n".join(body_lines).rstrip("\n") + "\n"
 
@@ -538,10 +846,12 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
 
         record_id = make_id()
         header = {
-            "wkb": WKB_VERSION,
+            "agent": args.agent,
+            "schema_version": SCHEMA_VERSION,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "type": "report",
+            "status": "SUCCESS",
             "id": record_id,
-            "type": "observation",
-            "status": "pending",
             "parent": parents,
             "interpretation": "",
             "topic": f"Dispatch: {result.topic}",
@@ -561,9 +871,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     seal = sub.add_parser("seal", help="create and checksum a new record")
-    seal.add_argument("--type", required=True)
+    seal.add_argument("--agent", required=True, help="which agent is producing this record")
+    seal.add_argument("--type", required=True, choices=sorted(TYPE_VALUES))
+    seal.add_argument("--status", default="SUCCESS", choices=sorted(STATUS_VALUES))
     seal.add_argument("--topic", required=True)
-    seal.add_argument("--status", default="pending")
+    seal.add_argument("--source", default="")
     seal.add_argument("--parent", action="append", default=[])
     seal.add_argument("--interpretation", default="")
     seal.add_argument("--regime", default="")
@@ -600,9 +912,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider", action="append", required=True, metavar="NAME=COMMAND",
         help="repeatable; shell command that reads the topic on stdin, prints its response on stdout",
     )
+    dispatch_p.add_argument("--agent", default="wkb-dispatch", help="agent name recorded if --seal is used")
     dispatch_p.add_argument("--parent", default=None, help="wkb id this dispatch is about")
     dispatch_p.add_argument("--seal", action="store_true", help="seal the result as a WKB record")
     dispatch_p.add_argument("--dir", default=str(DEFAULT_DIR))
+    dispatch_p.add_argument(
+        "--deny-pattern", action="append", default=[], metavar="REGEX",
+        help="repeatable; reject (before running anything) any --provider command "
+        "matching this regex. No patterns are built in -- provider commands are "
+        "arbitrary shell by design, so this is opt-in, not a sandbox.",
+    )
+    dispatch_p.add_argument(
+        "--judge", default=None, metavar="NAME=COMMAND",
+        help="optional; on DISAGREE only, run this provider against all disagreeing "
+        "positions and record its verdict as triage. Never runs on AGREE, so an "
+        "already-agreeing batch never pays for a judge call it doesn't need.",
+    )
     dispatch_p.set_defaults(func=cmd_dispatch)
 
     return p
