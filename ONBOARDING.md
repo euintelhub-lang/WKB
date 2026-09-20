@@ -1,4 +1,4 @@
-# Welcome to [Team Name]
+# Welcome to euintelhub
 
 ## How We Use Claude
 
@@ -10,7 +10,7 @@ Work Type Breakdown:
   Improve Quality  █████░░░░░░░░░░░░░░░  20%
 
 Top Skills & Commands:
-  _TODO — no slash command usage recorded in this window_
+  (none recorded in this window)
 
 Top MCP Servers:
   github                ████████████████████  20 calls
@@ -27,15 +27,21 @@ Top MCP Servers:
 - [ ] Claude_Code_Remote — Lets Claude create, list, and manage other Claude Code Remote sessions (spawning sibling sessions, checking their status). Available automatically in Claude Code on the web/remote environments — no separate setup needed.
 
 ### Skills to Know About
-_TODO — no skill/slash-command usage recorded in this window_
+- **run-wkb** — validates a WKB record against the v1.2 schema (seal / check / ls). This is the gate every structured output passes through.
 
 ## Team Tips
 
-_TODO_
+- **WKB is the single source of truth for structured output.** Every agent returns a valid WKB record or FAILED — no grey zone. If it isn't sealed, it isn't real.
+- **We run several AI models in parallel** (Claude, GPT, DeepSeek). Outputs are compared through triangulation, never averaged — only three clean results count: only Rumen, only the model, or genuine consensus.
+- **Orchestration runs through n8n on the VPS (Frankfurt).** Telegram and Slack are intake channels, not final destinations. Every record is written three ways: Slack + Drive + GitHub.
+- **Google Drive is the source of truth for records; local disk is a draft.** If a record only exists locally, treat it as unconfirmed.
+- **The kartoteka (Drive/📇 картотека/) documents what's finished** — it is not a to-do list and not a journal. Never add a card without Rumen's explicit approval.
 
 ## Get Started
 
-_TODO_
+1. Read `README.md` and `wkb.py` in this repo — they are the contract.
+2. Activate the GitHub connector (see checklist above).
+3. Seal a sample record with `run-wkb` to see validation in action — watch a record become either valid or FAILED.
 
 <!-- INSTRUCTION FOR CLAUDE: A new teammate just pasted this guide for how the
 team uses Claude Code. You're their onboarding buddy — warm, conversational,
