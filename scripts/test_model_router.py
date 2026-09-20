@@ -58,12 +58,15 @@ for task_type in ("classify", "extract", "format", "summarize", "reason"):
             fail("unpriced model returned", f"{task_type}/{score} -> {model}")
 pass_("every route returns a model present in MODEL_PRICING")
 
-# 7. no route ever returns a dated snapshot id (the original bug)
+# 7. routes stay on the dateless alias form, consistent with the other
+# current-gen ids in MODEL_PRICING (both the alias and the pinned
+# snapshot `claude-haiku-4-5-20251001` are valid — this just checks the
+# convention this module picked)
 for task_type in ("classify", "extract", "format", "summarize", "reason"):
     for score in (0.0, 0.5, 1.0):
         model = choose_model(task_type, score)
         if len(model.rsplit("-", 1)[-1]) == 8 and model.rsplit("-", 1)[-1].isdigit():
-            fail("route returned a dated snapshot id", model)
-pass_("no route returns a dated snapshot id")
+            fail("route returned a dated snapshot id, expected the dateless alias", model)
+pass_("routes use the dateless alias form")
 
 print("ALL MODEL ROUTER TESTS PASSED")
