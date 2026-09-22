@@ -1,0 +1,42 @@
+{
+  "id": "website-audit",
+  "title": "Бърз одит на сайт",
+  "description": "Проверка дали сайтът е готов за трафик.",
+  "verified": true,
+  "start": "has-ssl",
+  "questions": {
+    "has-ssl": {
+      "text": "Сайтът зарежда ли се през HTTPS (има ли валиден SSL сертификат)?",
+      "yes": "has-mobile",
+      "no": "resolution:fix-ssl"
+    },
+    "has-mobile": {
+      "text": "Сайтът показва ли се коректно на мобилен телефон?",
+      "yes": "has-analytics",
+      "no": "resolution:fix-mobile"
+    },
+    "has-analytics": {
+      "text": "Инсталиран ли е инструмент за анализ на трафика (напр. Google Analytics)?",
+      "yes": "resolution:ready",
+      "no": "resolution:add-analytics"
+    }
+  },
+  "resolutions": {
+    "fix-ssl": {
+      "title": "Липсва SSL",
+      "detail": "Сайтът трябва да получи валиден SSL сертификат преди да приема трафик."
+    },
+    "fix-mobile": {
+      "title": "Не е mobile-friendly",
+      "detail": "Сайтът трябва да се приведе в адаптивен вид за мобилни устройства."
+    },
+    "add-analytics": {
+      "title": "Липсва анализ на трафика",
+      "detail": "Добавете инструмент за анализ, за да можете да измервате резултатите."
+    },
+    "ready": {
+      "title": "Сайтът е готов",
+      "detail": "SSL, мобилна версия и анализ на трафика са налични."
+    }
+  }
+}
