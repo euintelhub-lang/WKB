@@ -45,8 +45,12 @@ def choose_model(task_type: str, complexity_score: float) -> str:
 
     `complexity_score` must be a number in [0.0, 1.0]; anything else
     (including NaN) raises ValueError instead of silently routing to
-    Haiku or Opus.
+    Haiku or Opus. `task_type` must be a non-empty string; an empty or
+    blank one raises ValueError (an unlisted-but-named type like
+    "summarize" is fine and routes by score).
     """
+    if not isinstance(task_type, str) or not task_type.strip():
+        raise ValueError(f"task_type must be a non-empty string, got {task_type!r}")
     if not 0.0 <= complexity_score <= 1.0:
         raise ValueError(f"complexity_score must be in [0.0, 1.0], got {complexity_score!r}")
     if task_type in CHEAP_TASK_TYPES or complexity_score < 0.3:

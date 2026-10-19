@@ -79,4 +79,15 @@ for bad in (-0.1, 1.1, 2.5, float("nan")):
         fail("out-of-range complexity accepted", f"{task_type}/{bad}")
 pass_("out-of-range complexity_score raises ValueError")
 
+# 9. empty/blank/non-string task_type is rejected; unlisted names still route
+for bad in ("", "   ", None, 5):
+    try:
+        choose_model(bad, 0.5)
+    except ValueError:
+        continue
+    fail("blank task_type accepted", repr(bad))
+if choose_model("banana", 0.5) != SONNET:
+    fail("unlisted non-empty task_type should still route by score")
+pass_("blank task_type raises ValueError; unlisted names route by score")
+
 print("ALL MODEL ROUTER TESTS PASSED")
