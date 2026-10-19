@@ -42,7 +42,13 @@ def choose_model(task_type: str, complexity_score: float) -> str:
     `task_type` in CHEAP_TASK_TYPES always routes to Haiku, independent of
     `complexity_score` — a classification/extraction/formatting task is
     assumed cheap by its structure, not by a caller-supplied score.
+
+    `complexity_score` must be a number in [0.0, 1.0]; anything else
+    (including NaN) raises ValueError instead of silently routing to
+    Haiku or Opus.
     """
+    if not 0.0 <= complexity_score <= 1.0:
+        raise ValueError(f"complexity_score must be in [0.0, 1.0], got {complexity_score!r}")
     if task_type in CHEAP_TASK_TYPES or complexity_score < 0.3:
         return HAIKU
     if complexity_score < 0.7:
