@@ -69,4 +69,14 @@ for task_type in ("classify", "extract", "format", "summarize", "reason"):
             fail("route returned a dated snapshot id, expected the dateless alias", model)
 pass_("routes use the dateless alias form")
 
+# 8. out-of-range or NaN scores are rejected, even for cheap task types
+for bad in (-0.1, 1.1, 2.5, float("nan")):
+    for task_type in ("classify", "summarize"):
+        try:
+            choose_model(task_type, bad)
+        except ValueError:
+            continue
+        fail("out-of-range complexity accepted", f"{task_type}/{bad}")
+pass_("out-of-range complexity_score raises ValueError")
+
 print("ALL MODEL ROUTER TESTS PASSED")

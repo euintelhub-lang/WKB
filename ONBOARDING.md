@@ -27,9 +27,11 @@ Top MCP Servers:
 - [ ] Claude_Code_Remote — Lets Claude create, list, and manage other Claude Code Remote sessions (spawning sibling sessions, checking their status). Available automatically in Claude Code on the web/remote environments — no separate setup needed.
 
 ### Skills to Know About
-- **run-wkb** — validates a WKB record against the v1.2 schema (seal / check / ls). This is the gate every structured output passes through.
+- **run-wkb** — validates a WKB record against the current schema, v1.0 — ecosystem's `agent-output.schema.yaml` (seal / check / ls). This is the gate every structured output passes through.
 
 ## Team Tips
+
+The first four tips describe the team's surrounding environment (VPS, n8n, Slack, Drive) — none of that is implemented in this repo, so don't look for it in the code.
 
 - **WKB is the single source of truth for structured output.** Every agent returns a valid WKB record or FAILED — no grey zone. If it isn't sealed, it isn't real.
 - **We run several AI models in parallel** (Claude, GPT, DeepSeek). Outputs are compared through triangulation, never averaged — only three clean results count: only Rumen, only the model, or genuine consensus.
